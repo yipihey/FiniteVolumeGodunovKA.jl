@@ -4,7 +4,7 @@
 fast on **CPU and CUDA** (Metal a desirable bonus) — covering the full solver suite we
 benchmarked: hydro / GLM-MHD / CT × PLM/PPM × ±species, with HLL/HLLC/HLLD/LLF. The library
 exists because CUDA.jl/KA codegen tops out at ~60–67% of hand-written `.cu` for these kernels
-(see `../JULIA_NATIVE_PERF.md`); the performance backends route *around* that wall (SIMD on
+(measured separately on the parent project); the performance backends route *around* that wall (SIMD on
 CPU, transpile-to-native on GPU) while the user authors only Julia.
 
 This is the KernelAbstractions *philosophy* (write-once, multi-backend) specialized to FV
