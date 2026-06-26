@@ -57,6 +57,11 @@ function _mspeed1_kernel!(spd, U, s, nx, ::Val{N}) where {N}
     (i <= nx) && (@inbounds spd[i] = maxspeed_x(s, cons2prim(s, _mread1(U, i, Val(N)))))
     return
 end
+function _msource1_kernel!(U, s, dt, nx, ::Val{N}) where {N}
+    i = _mtid1()
+    (i <= nx) && _mwrite1!(U, i, source(s, _mread1(U, i, Val(N)), dt))
+    return
+end
 
 mutable struct Grid1DMtl{N,S<:FVSystem,R,RS}
     sys::S; recon::R; rsol::RS
@@ -78,6 +83,7 @@ function mstep1d!(g::Grid1DMtl{N}, dt) where {N}
     Metal.@metal threads=thr groups=grp _mstep1_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
         Float32(dt)/g.dx, g.nx, Val(N), Val(g.bc), identperm(Val(N)))
     g.U, g.Unew = g.Unew, g.U
+    has_source(g.sys) && Metal.@metal threads=thr groups=grp _msource1_kernel!(g.U, g.sys, Float32(dt), g.nx, Val(N))
     return g
 end
 function mmax_wavespeed_1d(g::Grid1DMtl{N}) where {N}
