@@ -30,7 +30,8 @@
 using FiniteVolumeGodunovKA, Metal
 const FV = FiniteVolumeGodunovKA
 import FiniteVolumeGodunovKA: _update_dir, _gidx, _swap, identperm, dirperm, has_source,
-                              cons2prim, source, fastspeed_x, maxspeed_x, FVSystem, PLM, HLLC
+                              cons2prim, source, fastspeed_x, maxspeed_x, _halfstep, riemann,
+                              FVSystem, PLM, HLLC
 
 # Metal thread-index intrinsics return 1-based global grid positions.
 @inline _mtid1() = thread_position_in_grid_1d()
@@ -228,6 +229,60 @@ function _mspeed3_kernel!(spd, U, s, nx, ny, nz, ::Val{N}, py, pz) where {N}
     return
 end
 
+@inline _mread3_axis(U, i, j, k, o, nx, ny, nz, bc, ::Val{1}, ::Val{N}) where {N} =
+    _mread3(U, _gidx(i + o, nx, bc), j, k, Val(N))
+@inline _mread3_axis(U, i, j, k, o, nx, ny, nz, bc, ::Val{2}, ::Val{N}) where {N} =
+    _mread3(U, i, _gidx(j + o, ny, bc), k, Val(N))
+@inline _mread3_axis(U, i, j, k, o, nx, ny, nz, bc, ::Val{3}, ::Val{N}) where {N} =
+    _mread3(U, i, j, _gidx(k + o, nz, bc), Val(N))
+
+@inline _mwrite3_axis!(U, i, j, k, o, v, ::Val{1}) = _mwrite3!(U, i + o, j, k, v)
+@inline _mwrite3_axis!(U, i, j, k, o, v, ::Val{2}) = _mwrite3!(U, i, j + o, k, v)
+@inline _mwrite3_axis!(U, i, j, k, o, v, ::Val{3}) = _mwrite3!(U, i, j, k + o, v)
+
+@inline _maxis_coord(i, j, k, ::Val{1}) = (2 * (i - 1) + 1, j, k)
+@inline _maxis_coord(i, j, k, ::Val{2}) = (i, 2 * (j - 1) + 1, k)
+@inline _maxis_coord(i, j, k, ::Val{3}) = (i, j, 2 * (k - 1) + 1)
+
+@inline _maxis_valid(i, j, k, nx, ny, nz, ::Val{1}) = i <= nx && j <= ny && k <= nz
+@inline _maxis_valid(i, j, k, nx, ny, nz, ::Val{2}) = i <= nx && j <= ny && k <= nz
+@inline _maxis_valid(i, j, k, nx, ny, nz, ::Val{3}) = i <= nx && j <= ny && k <= nz
+
+@inline function _mhalf_axis(U, s, r, i, j, k, o, λ, nx, ny, nz, bc, axis, perm, ::Val{N}) where {N}
+    um = _mread3_axis(U, i, j, k, o - 1, nx, ny, nz, bc, axis, Val(N))
+    u0 = _mread3_axis(U, i, j, k, o,     nx, ny, nz, bc, axis, Val(N))
+    up = _mread3_axis(U, i, j, k, o + 1, nx, ny, nz, bc, axis, Val(N))
+    return _halfstep(s, r, _swap(um, perm), _swap(u0, perm), _swap(up, perm), λ)
+end
+
+function _mstep3_pair_kernel!(Unew, U, s, r, rs, λ, nx, ny, nz, ::Val{N}, bc, axis::Val{A}, perm) where {N,A}
+    ti, tj, tk = _mtid3()
+    i, j, k = _maxis_coord(ti, tj, tk, axis)
+    if _maxis_valid(i, j, k, nx, ny, nz, axis)
+        wlm, wrm = _mhalf_axis(U, s, r, i, j, k, -1, λ, nx, ny, nz, bc, axis, perm, Val(N))
+        wl0, wr0 = _mhalf_axis(U, s, r, i, j, k,  0, λ, nx, ny, nz, bc, axis, perm, Val(N))
+        wl1, wr1 = _mhalf_axis(U, s, r, i, j, k,  1, λ, nx, ny, nz, bc, axis, perm, Val(N))
+        wl2, wr2 = _mhalf_axis(U, s, r, i, j, k,  2, λ, nx, ny, nz, bc, axis, perm, Val(N))
+        f0 = riemann(rs, s, wrm, wl0)
+        f1 = riemann(rs, s, wr0, wl1)
+        f2 = riemann(rs, s, wr1, wl2)
+        u0 = _mread3_axis(U, i, j, k, 0, nx, ny, nz, bc, axis, Val(N))
+        _mwrite3_axis!(Unew, i, j, k, 0, u0 .- λ .* _swap(f1 .- f0, perm), axis)
+        if A == 1
+            ok2 = i + 1 <= nx
+        elseif A == 2
+            ok2 = j + 1 <= ny
+        else
+            ok2 = k + 1 <= nz
+        end
+        if ok2
+            u1 = _mread3_axis(U, i, j, k, 1, nx, ny, nz, bc, axis, Val(N))
+            _mwrite3_axis!(Unew, i, j, k, 1, u1 .- λ .* _swap(f2 .- f1, perm), axis)
+        end
+    end
+    return
+end
+
 mutable struct Grid3DMtl{N,S<:FVSystem,R,RS}
     sys::S; recon::R; rsol::RS
     U::MtlArray{Float32,4}; Unew::MtlArray{Float32,4}; spd::MtlArray{Float32,3}
@@ -242,18 +297,48 @@ function Grid3DMtl(sys::FVSystem, U0::Array{NTuple{N,T},3};
         sys, recon, rsol, U, similar(U), Metal.zeros(Float32, nx, ny, nz),
         nx, ny, nz, Float32(dx), Float32(dy), Float32(dz), bc, Float32(cfl))
 end
-@inline _mcfg3(nx, ny, nz) = ((8, 8, 4), (cld(nx, 8), cld(ny, 8), cld(nz, 4)))
+@inline _mcfg3(nx, ny, nz) = ((16, 8, 2), (cld(nx, 16), cld(ny, 8), cld(nz, 2)))
+@inline _mpaircfg3(nx, ny, nz, ::Val{1}) = ((16, 8, 2), (cld(cld(nx, 2), 16), cld(ny, 8), cld(nz, 2)))
+@inline _mpaircfg3(nx, ny, nz, ::Val{2}) = ((16, 8, 2), (cld(nx, 16), cld(cld(ny, 2), 8), cld(nz, 2)))
+@inline _mpaircfg3(nx, ny, nz, ::Val{3}) = ((16, 8, 2), (cld(nx, 16), cld(ny, 8), cld(cld(nz, 2), 2)))
+
+function _mpair_sweep3!(g::Grid3DMtl{N}, dt, axis::Val{A}, perm) where {N,A}
+    thr, grp = _mpaircfg3(g.nx, g.ny, g.nz, axis)
+    λ = A == 1 ? Float32(dt)/g.dx : A == 2 ? Float32(dt)/g.dy : Float32(dt)/g.dz
+    Metal.@metal threads=thr groups=grp _mstep3_pair_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
+        λ, g.nx, g.ny, g.nz, Val(N), Val(g.bc), axis, perm)
+    g.U, g.Unew = g.Unew, g.U
+    return g
+end
+
+@inline _muse_pair3(g::Grid3DMtl) = min(g.nx, g.ny, g.nz) >= 96
+
+function _mfused_sweep3!(g::Grid3DMtl{N}, dt, axis::Val{A}, perm) where {N,A}
+    thr, grp = _mcfg3(g.nx, g.ny, g.nz)
+    λ = A == 1 ? Float32(dt)/g.dx : A == 2 ? Float32(dt)/g.dy : Float32(dt)/g.dz
+    kern = A == 1 ? _msweepx3_kernel! : A == 2 ? _msweepy3_kernel! : _msweepz3_kernel!
+    Metal.@metal threads=thr groups=grp kern(g.Unew, g.U, g.sys, g.recon, g.rsol,
+        λ, g.nx, g.ny, g.nz, Val(N), Val(g.bc), perm)
+    g.U, g.Unew = g.Unew, g.U
+    return g
+end
 
 function mstep3d!(g::Grid3DMtl{N}, dt; rev::Bool = false) where {N}
-    thr, grp = _mcfg3(g.nx, g.ny, g.nz); bc = Val(g.bc)
     px = identperm(Val(N)); py = dirperm(g.sys, N, 2); pz = dirperm(g.sys, N, 3)
-    sweep(kern, λ, perm) = (Metal.@metal threads=thr groups=grp kern(g.Unew, g.U, g.sys, g.recon, g.rsol,
-        λ, g.nx, g.ny, g.nz, Val(N), bc, perm); (g.U, g.Unew) = (g.Unew, g.U))
-    if rev
-        sweep(_msweepz3_kernel!, Float32(dt)/g.dz, pz); sweep(_msweepy3_kernel!, Float32(dt)/g.dy, py); sweep(_msweepx3_kernel!, Float32(dt)/g.dx, px)
+    if _muse_pair3(g)
+        if rev
+            _mpair_sweep3!(g, dt, Val(3), pz); _mpair_sweep3!(g, dt, Val(2), py); _mpair_sweep3!(g, dt, Val(1), px)
+        else
+            _mpair_sweep3!(g, dt, Val(1), px); _mpair_sweep3!(g, dt, Val(2), py); _mpair_sweep3!(g, dt, Val(3), pz)
+        end
     else
-        sweep(_msweepx3_kernel!, Float32(dt)/g.dx, px); sweep(_msweepy3_kernel!, Float32(dt)/g.dy, py); sweep(_msweepz3_kernel!, Float32(dt)/g.dz, pz)
+        if rev
+            _mfused_sweep3!(g, dt, Val(3), pz); _mfused_sweep3!(g, dt, Val(2), py); _mfused_sweep3!(g, dt, Val(1), px)
+        else
+            _mfused_sweep3!(g, dt, Val(1), px); _mfused_sweep3!(g, dt, Val(2), py); _mfused_sweep3!(g, dt, Val(3), pz)
+        end
     end
+    thr, grp = _mcfg3(g.nx, g.ny, g.nz)
     has_source(g.sys) && Metal.@metal threads=thr groups=grp _msource3_kernel!(g.U, g.sys, Float32(dt), g.nx, g.ny, g.nz, Val(N))
     return g
 end
