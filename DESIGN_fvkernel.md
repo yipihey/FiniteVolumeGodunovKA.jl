@@ -355,11 +355,15 @@ past it either trades occupancy the wrong way or needs a non-generic layout. The
 10. **Metal** — DONE (`metal/metal.jl`): `Grid1DMtl`/`Grid2DMtl`/`Grid3DMtl` at full parity with the CUDA
     1D/2D/3D backends (identical kernel bodies; only the launch macro, `thread_position_in_grid_*d`, and
     `MtlArray` differ; alternating Strang + `has_source` + dynamic `ch` mirrored). Statically validated on
-    the Linux host (parses; all referenced module names resolve) but UNTESTED on hardware — Metal.jl is
-    macOS-only. Validate on a Mac via `metal_selfcheck_{1d,2d,3d}()` (must be bit-identical to scalar),
-    then measure the Metal.jl-vs-roofline gap (the open question: does it need an MSL transpile target, as
-    CUDA needed `Grid3DCuMarch`?). The transpile→nvcc backend has no Metal analog yet.
-11. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).
+    the Linux host and runtime-validated on Apple Metal via `metal_selfcheck_{1d,2d,3d}()` (bit-identical
+    to scalar). `Grid3DMtl` also supports the packed `UInt16` log2 color/species sidecar and validates via
+    `metal_selfcheck_3d_colors()`. The Metal.jl-vs-roofline gap remains the open question: does it need an
+    MSL transpile target, as CUDA needed `Grid3DCuMarch`? The transpile→nvcc backend has no Metal analog yet.
+11. **Packed color/species fractions** — scalar 1D/2D/3D and Metal 3D support a sidecar `colors=...`
+    implementation following `GLMMHDTurb`'s `U16SP` trace-species path: store intensive fractions as
+    `UInt16` log2(X) over `[2^-110,1]`, reconstruct in log space, decode only at fluxes, and advect with
+    CMA (`F_species = F_mass * X_upwind`). CUDA/SIMD sidecars are still to mirror this scalar reference.
+12. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).
 
 Conformance lives in the parent `GLMMHDTurb` repo (OT, Sod, turbulence, div·B, the gradient-IC
 benchmarks): the spec is "reproduce that matrix from one physics source on every backend."

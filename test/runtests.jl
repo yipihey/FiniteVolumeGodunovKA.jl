@@ -12,6 +12,59 @@ const FV = FiniteVolumeGodunovKA
     @test all(isapprox.(cons2prim(s, prim2cons(s, W)), W; rtol = 1f-5))
 end
 
+@testset "packed color/species fractions" begin
+    vals = Float32[1f0, 0.3f0, 1f-8, 1f-20, 1f-32]
+    for x in vals
+        y = unpack_color_fraction(pack_color_fraction(x))
+        @test y > 0f0
+        @test isapprox(log2(y), log2(max(x, FV.color_fraction_floor())); atol = 110f0 / 65535f0)
+    end
+
+    s = Euler(γ = 1.4f0)
+    n = 96
+    dx = 1f0 / n
+    U0 = [prim2cons(s, (1f0 + 0.2f0 * sinpi(2f0 * (i - 0.5f0) / n),
+                         0.7f0, 0f0, 0f0, 1f0)) for i in 1:n]
+    colors = hcat(fill(0.25f0, n), fill(1f-20, n))
+    g = Grid1D(s, U0; dx, bc = :periodic, recon = PLM(), rsol = HLLC(), colors)
+    @test ncolors(g) == 2
+    for step in 1:10
+        FV.step!(g, 0.05f0 * dx)
+    end
+    X = color_fractions(g)
+    @test maximum(abs.(X[:, 1] .- X[1, 1])) <= 2f-4
+    @test maximum(abs.(log2.(X[:, 2]) .- log2(X[1, 2]))) <= 2f-3
+
+    colors2 = hcat([0.3f0 + 0.1f0 * sinpi(2f0 * (i - 0.5f0) / n) for i in 1:n],
+                   [1f-20 * (1f0 + 0.4f0 * sinpi(2f0 * (i - 0.5f0) / n)) for i in 1:n])
+    g2 = Grid1D(s, copy(U0); dx, bc = :periodic, recon = PLM(), rsol = HLLC(), colors = colors2)
+    color_mass(g, X, q) = sum(Float32(g.U[i][1]) * X[i, q] for i in 1:g.nx) * dx
+    X20 = color_fractions(g2)
+    m0 = (color_mass(g2, X20, 1), color_mass(g2, X20, 2))
+    for step in 1:20
+        FV.step!(g2, 0.03f0 * dx)
+    end
+    X21 = color_fractions(g2)
+    m1 = (color_mass(g2, X21, 1), color_mass(g2, X21, 2))
+    rel = abs.((m1 .- m0) ./ m0)
+    @test rel[1] <= 5f-5
+    @test rel[2] <= 5f-4
+
+    m = 12
+    d = 1f0 / m
+    U3 = [prim2cons(s, (1f0 + 0.1f0 * sinpi(2f0 * (i + j + k) / m),
+                         0.3f0, 0.2f0, 0.1f0, 1f0)) for i in 1:m, j in 1:m, k in 1:m]
+    C3 = Array{Float32,4}(undef, m, m, m, 2)
+    C3[:, :, :, 1] .= 0.4f0
+    C3[:, :, :, 2] .= 1f-18
+    g3 = Grid3D(s, U3; dx = d, dy = d, dz = d, bc = :periodic, recon = PLM(), rsol = HLLC(), colors = C3)
+    FV.step!(g3, 0.03f0 * d)
+    X3 = color_fractions(g3)
+    @test size(X3) == (m, m, m, 2)
+    @test maximum(abs.(X3[:, :, :, 1] .- X3[1, 1, 1, 1])) <= 3f-4
+    @test maximum(abs.(log2.(X3[:, :, :, 2]) .- log2(X3[1, 1, 1, 2]))) <= 3f-3
+end
+
 # ---------------------------------------------------------------------------
 # Sod shock tube (Float32, HLLC) — exercises cons2prim/prim2cons/physflux/HLLC,
 # the limiter, and the conservative update against the known star state.

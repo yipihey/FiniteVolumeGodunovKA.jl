@@ -30,6 +30,8 @@ using Libdl
 export @fvsystem, FVSystem
 export cons2prim, prim2cons, physflux_x, maxspeed_x, nconserved   # the contract API (build ICs, query physics)
 export PLM, PCM, LLF, HLL, HLLC, HLLD
+export pack_color_fraction, pack_color_log2, unpack_color_fraction, unpack_color_log2
+export color_fraction_floor, color_log2_floor, color_fractions, ncolors
 export Grid1D, step!, evolve!, primitives, conserved_total
 export Grid1DSoA, evolve_simd!, primitives_soa
 export Grid1DCU, evolve_cuda!, primitives_cuda
@@ -87,6 +89,7 @@ include("macro.jl")
 include("reconstruct.jl")
 include("riemann.jl")
 include("dimsplit.jl")
+include("colors.jl")
 include("backend_cpu.jl")
 include("backend_cpu_simd.jl")
 include("backend_cuda.jl")

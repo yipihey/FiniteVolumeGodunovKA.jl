@@ -11,6 +11,8 @@ mutable struct Grid2D{N,T,S<:FVSystem,R,RS}
     rsol::RS
     U::Matrix{NTuple{N,T}}     # (nx, ny)
     Ut::Matrix{NTuple{N,T}}    # ping-pong buffer
+    colors::Union{Nothing,Array{UInt16,3}}
+    colorst::Union{Nothing,Array{UInt16,3}}
     nx::Int
     ny::Int
     dx::T
@@ -21,19 +23,33 @@ end
 
 function Grid2D(sys::FVSystem, U0::Matrix{NTuple{N,T}};
                 dx, dy, bc::Symbol = :outflow, recon = PLM(), rsol = HLLC(),
-                cfl = T(0.4)) where {N,T}
+                cfl = T(0.4), colors=nothing) where {N,T}
     nx, ny = size(U0)
+    C, Ct = _pack_colors(colors, (nx, ny))
     Grid2D{N,T,typeof(sys),typeof(recon),typeof(rsol)}(
-        sys, recon, rsol, copy(U0), similar(U0), nx, ny, T(dx), T(dy), bc, T(cfl))
+        sys, recon, rsol, copy(U0), similar(U0), C, Ct, nx, ny, T(dx), T(dy), bc, T(cfl))
 end
 
 function _sweep_x!(g::Grid2D{N,T}, dt) where {N,T}
     s, r, rs = g.sys, g.recon, g.rsol
     λ = T(dt) / g.dx; nx, ny = g.nx, g.ny; bc = Val(g.bc); perm = identperm(Val(N))
+    U = g.U
     @inbounds for j in 1:ny, i in 1:nx
-        im2 = g.U[_gidx(i-2, nx, bc), j]; im1 = g.U[_gidx(i-1, nx, bc), j]; i0 = g.U[i, j]
-        ip1 = g.U[_gidx(i+1, nx, bc), j]; ip2 = g.U[_gidx(i+2, nx, bc), j]
+        im2 = U[_gidx(i-2, nx, bc), j]; im1 = U[_gidx(i-1, nx, bc), j]; i0 = U[i, j]
+        ip1 = U[_gidx(i+1, nx, bc), j]; ip2 = U[_gidx(i+2, nx, bc), j]
         g.Ut[i, j] = _update_dir(s, r, rs, im2, im1, i0, ip1, ip2, λ, perm)
+    end
+    if g.colors !== nothing
+        C = g.colors; Ct = g.colorst
+        @inbounds for q in 1:size(C, 3), j in 1:ny, i in 1:nx
+            Ct[i, j, q] = _update_packed_color(s, r, rs,
+                U[_gidx(i - 2, nx, bc), j], U[_gidx(i - 1, nx, bc), j], U[i, j],
+                U[_gidx(i + 1, nx, bc), j], U[_gidx(i + 2, nx, bc), j],
+                C[_gidx(i - 2, nx, bc), j, q], C[_gidx(i - 1, nx, bc), j, q], C[i, j, q],
+                C[_gidx(i + 1, nx, bc), j, q], C[_gidx(i + 2, nx, bc), j, q],
+                λ, perm, g.Ut[i, j][1])
+        end
+        g.colors, g.colorst = g.colorst, g.colors
     end
     g.U, g.Ut = g.Ut, g.U
 end
@@ -41,10 +57,23 @@ end
 function _sweep_y!(g::Grid2D{N,T}, dt) where {N,T}
     s, r, rs = g.sys, g.recon, g.rsol
     λ = T(dt) / g.dy; nx, ny = g.nx, g.ny; bc = Val(g.bc); perm = dirperm(s, N, 2)
+    U = g.U
     @inbounds for i in 1:nx, j in 1:ny
-        jm2 = g.U[i, _gidx(j-2, ny, bc)]; jm1 = g.U[i, _gidx(j-1, ny, bc)]; j0 = g.U[i, j]
-        jp1 = g.U[i, _gidx(j+1, ny, bc)]; jp2 = g.U[i, _gidx(j+2, ny, bc)]
+        jm2 = U[i, _gidx(j-2, ny, bc)]; jm1 = U[i, _gidx(j-1, ny, bc)]; j0 = U[i, j]
+        jp1 = U[i, _gidx(j+1, ny, bc)]; jp2 = U[i, _gidx(j+2, ny, bc)]
         g.Ut[i, j] = _update_dir(s, r, rs, jm2, jm1, j0, jp1, jp2, λ, perm)
+    end
+    if g.colors !== nothing
+        C = g.colors; Ct = g.colorst
+        @inbounds for q in 1:size(C, 3), i in 1:nx, j in 1:ny
+            Ct[i, j, q] = _update_packed_color(s, r, rs,
+                U[i, _gidx(j - 2, ny, bc)], U[i, _gidx(j - 1, ny, bc)], U[i, j],
+                U[i, _gidx(j + 1, ny, bc)], U[i, _gidx(j + 2, ny, bc)],
+                C[i, _gidx(j - 2, ny, bc), q], C[i, _gidx(j - 1, ny, bc), q], C[i, j, q],
+                C[i, _gidx(j + 1, ny, bc), q], C[i, _gidx(j + 2, ny, bc), q],
+                λ, perm, g.Ut[i, j][1])
+        end
+        g.colors, g.colorst = g.colorst, g.colors
     end
     g.U, g.Ut = g.Ut, g.U
 end

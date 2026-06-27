@@ -13,6 +13,8 @@ mutable struct Grid1D{N,T,S<:FVSystem,R,RS}
     recon::R
     rsol::RS
     U::Vector{NTuple{N,T}}
+    colors::Union{Nothing,Array{UInt16,2}}
+    colorst::Union{Nothing,Array{UInt16,2}}
     nx::Int
     dx::T
     bc::Symbol      # :periodic | :outflow
@@ -20,9 +22,11 @@ mutable struct Grid1D{N,T,S<:FVSystem,R,RS}
 end
 
 function Grid1D(sys::FVSystem, U0::Vector{NTuple{N,T}};
-                dx, bc::Symbol=:outflow, recon=PLM(), rsol=HLLC(), cfl=T(0.4)) where {N,T}
+                dx, bc::Symbol=:outflow, recon=PLM(), rsol=HLLC(), cfl=T(0.4),
+                colors=nothing) where {N,T}
+    C, Ct = _pack_colors(colors, (length(U0),))
     Grid1D{N,T,typeof(sys),typeof(recon),typeof(rsol)}(
-        sys, recon, rsol, copy(U0), length(U0), T(dx), bc, T(cfl))
+        sys, recon, rsol, copy(U0), C, Ct, length(U0), T(dx), bc, T(cfl))
 end
 
 primitives(g::Grid1D) = [cons2prim(g.sys, u) for u in g.U]
@@ -70,6 +74,7 @@ end
 function step!(g::Grid1D{N,T}, dt) where {N,T}
     s, dx, nx, ng = g.sys, g.dx, g.nx, _NG
     λ = T(dt) / dx
+    Uold = g.U
     Wp = _padded_primitives(g)
 
     # MUSCL-Hancock predictor: half-step the limited face states by dt/2.
@@ -90,7 +95,22 @@ function step!(g::Grid1D{N,T}, dt) where {N,T}
         j  = i + ng
         Fl = riemann(g.rsol, s, WRh[j-1], WLh[j])    # interface i-1/2
         Fr = riemann(g.rsol, s, WRh[j],   WLh[j+1])  # interface i+1/2
-        Unew[i] = g.U[i] .- λ .* (Fr .- Fl)
+        Unew[i] = Uold[i] .- λ .* (Fr .- Fl)
+    end
+    if g.colors !== nothing
+        C = g.colors
+        Ct = g.colorst
+        bc = Val(g.bc)
+        perm = identperm(Val(N))
+        @inbounds for q in 1:size(C, 2), i in 1:nx
+            Ct[i, q] = _update_packed_color(s, g.recon, g.rsol,
+                Uold[_gidx(i - 2, nx, bc)], Uold[_gidx(i - 1, nx, bc)], Uold[i],
+                Uold[_gidx(i + 1, nx, bc)], Uold[_gidx(i + 2, nx, bc)],
+                C[_gidx(i - 2, nx, bc), q], C[_gidx(i - 1, nx, bc), q], C[i, q],
+                C[_gidx(i + 1, nx, bc), q], C[_gidx(i + 2, nx, bc), q],
+                λ, perm, Unew[i][1])
+        end
+        g.colors, g.colorst = g.colorst, g.colors
     end
     if has_source(s)
         @inbounds for i in 1:nx

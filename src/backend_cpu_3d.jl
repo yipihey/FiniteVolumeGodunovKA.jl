@@ -9,6 +9,8 @@ mutable struct Grid3D{N,T,S<:FVSystem,R,RS}
     rsol::RS
     U::Array{NTuple{N,T},3}      # (nx, ny, nz)
     Ut::Array{NTuple{N,T},3}
+    colors::Union{Nothing,Array{UInt16,4}}
+    colorst::Union{Nothing,Array{UInt16,4}}
     nx::Int; ny::Int; nz::Int
     dx::T; dy::T; dz::T
     bc::Symbol; cfl::T
@@ -16,10 +18,11 @@ end
 
 function Grid3D(sys::FVSystem, U0::Array{NTuple{N,T},3};
                dx, dy, dz, bc::Symbol = :outflow, recon = PLM(), rsol = HLLC(),
-               cfl = T(0.4)) where {N,T}
+               cfl = T(0.4), colors=nothing) where {N,T}
     nx, ny, nz = size(U0)
+    C, Ct = _pack_colors(colors, (nx, ny, nz))
     Grid3D{N,T,typeof(sys),typeof(recon),typeof(rsol)}(
-        sys, recon, rsol, copy(U0), similar(U0), nx, ny, nz, T(dx), T(dy), T(dz), bc, T(cfl))
+        sys, recon, rsol, copy(U0), similar(U0), C, Ct, nx, ny, nz, T(dx), T(dy), T(dz), bc, T(cfl))
 end
 
 function _sweep_x3d!(g::Grid3D{N,T}, dt) where {N,T}
@@ -28,6 +31,18 @@ function _sweep_x3d!(g::Grid3D{N,T}, dt) where {N,T}
     @inbounds for k in 1:nz, j in 1:ny, i in 1:nx
         g.Ut[i,j,k] = _update_dir(s, r, rs, U[_gidx(i-2,nx,bc),j,k], U[_gidx(i-1,nx,bc),j,k],
                                   U[i,j,k], U[_gidx(i+1,nx,bc),j,k], U[_gidx(i+2,nx,bc),j,k], λ, perm)
+    end
+    if g.colors !== nothing
+        C = g.colors; Ct = g.colorst
+        @inbounds for q in 1:size(C, 4), k in 1:nz, j in 1:ny, i in 1:nx
+            Ct[i, j, k, q] = _update_packed_color(s, r, rs,
+                U[_gidx(i - 2, nx, bc), j, k], U[_gidx(i - 1, nx, bc), j, k], U[i, j, k],
+                U[_gidx(i + 1, nx, bc), j, k], U[_gidx(i + 2, nx, bc), j, k],
+                C[_gidx(i - 2, nx, bc), j, k, q], C[_gidx(i - 1, nx, bc), j, k, q], C[i, j, k, q],
+                C[_gidx(i + 1, nx, bc), j, k, q], C[_gidx(i + 2, nx, bc), j, k, q],
+                λ, perm, g.Ut[i, j, k][1])
+        end
+        g.colors, g.colorst = g.colorst, g.colors
     end
     g.U, g.Ut = g.Ut, g.U
 end
@@ -39,6 +54,18 @@ function _sweep_y3d!(g::Grid3D{N,T}, dt) where {N,T}
         g.Ut[i,j,k] = _update_dir(s, r, rs, U[i,_gidx(j-2,ny,bc),k], U[i,_gidx(j-1,ny,bc),k],
                                   U[i,j,k], U[i,_gidx(j+1,ny,bc),k], U[i,_gidx(j+2,ny,bc),k], λ, perm)
     end
+    if g.colors !== nothing
+        C = g.colors; Ct = g.colorst
+        @inbounds for q in 1:size(C, 4), k in 1:nz, j in 1:ny, i in 1:nx
+            Ct[i, j, k, q] = _update_packed_color(s, r, rs,
+                U[i, _gidx(j - 2, ny, bc), k], U[i, _gidx(j - 1, ny, bc), k], U[i, j, k],
+                U[i, _gidx(j + 1, ny, bc), k], U[i, _gidx(j + 2, ny, bc), k],
+                C[i, _gidx(j - 2, ny, bc), k, q], C[i, _gidx(j - 1, ny, bc), k, q], C[i, j, k, q],
+                C[i, _gidx(j + 1, ny, bc), k, q], C[i, _gidx(j + 2, ny, bc), k, q],
+                λ, perm, g.Ut[i, j, k][1])
+        end
+        g.colors, g.colorst = g.colorst, g.colors
+    end
     g.U, g.Ut = g.Ut, g.U
 end
 
@@ -48,6 +75,18 @@ function _sweep_z3d!(g::Grid3D{N,T}, dt) where {N,T}
     @inbounds for k in 1:nz, j in 1:ny, i in 1:nx
         g.Ut[i,j,k] = _update_dir(s, r, rs, U[i,j,_gidx(k-2,nz,bc)], U[i,j,_gidx(k-1,nz,bc)],
                                   U[i,j,k], U[i,j,_gidx(k+1,nz,bc)], U[i,j,_gidx(k+2,nz,bc)], λ, perm)
+    end
+    if g.colors !== nothing
+        C = g.colors; Ct = g.colorst
+        @inbounds for q in 1:size(C, 4), k in 1:nz, j in 1:ny, i in 1:nx
+            Ct[i, j, k, q] = _update_packed_color(s, r, rs,
+                U[i, j, _gidx(k - 2, nz, bc)], U[i, j, _gidx(k - 1, nz, bc)], U[i, j, k],
+                U[i, j, _gidx(k + 1, nz, bc)], U[i, j, _gidx(k + 2, nz, bc)],
+                C[i, j, _gidx(k - 2, nz, bc), q], C[i, j, _gidx(k - 1, nz, bc), q], C[i, j, k, q],
+                C[i, j, _gidx(k + 1, nz, bc), q], C[i, j, _gidx(k + 2, nz, bc), q],
+                λ, perm, g.Ut[i, j, k][1])
+        end
+        g.colors, g.colorst = g.colorst, g.colors
     end
     g.U, g.Ut = g.Ut, g.U
 end

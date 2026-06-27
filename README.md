@@ -45,13 +45,34 @@ Plus **`Grid2DCT`** (constrained transport — face-staggered B + edge EMF → m
 solvers: `LLF`, `HLL`, `HLLC` (Euler), `HLLD` (MHD). Reconstruction: `PLM` (MC limiter / unlimited), `PCM`.
 
 ¹ **Metal** (Apple GPU, `metal/metal.jl`) mirrors the CUDA backends 1D/2D/3D — kernel bodies identical,
-only the launch macro / thread-index intrinsics / array type differ. It is **UNTESTED** (written on a
-Linux/NVIDIA host where Metal.jl can't run); validate on a Mac with `metal_selfcheck_{1d,2d,3d}()` (each
-must be bit-identical to the scalar reference). The transpile→nvcc path has no Metal analog (it builds via
-`nvcc`); an MSL transpile target is future work.
+only the launch macro / thread-index intrinsics / array type differ. Validate on a Mac with
+`metal_selfcheck_{1d,2d,3d}()` (each must be bit-identical to the scalar reference). The transpile→nvcc
+path has no Metal analog (it builds via `nvcc`); an MSL transpile target is future work.
 
 Every fast path is **bit-identical** to its scalar reference (max |Δ| = 0) on Sod/Brio-Wu/smooth-wave
 across the solvers; rotation (1, 2, or 3 axes; momentum + B) is exact; schemes are 2nd order in 1D/2D/3D.
+
+## Packed color/species fractions
+
+The scalar `Grid1D`/`Grid2D`/`Grid3D` constructors accept passive color/species fractions through
+`colors=...`; the 3D Metal backend accepts the same keyword on `Grid3DMtl`. This follows the
+`GLMMHDTurb` reference `U16SP` path for isolated trace tracers: fractions are stored out-of-band from
+the hydro/MHD conserved tuple as `UInt16` log2 values over `[2^-110, 1]`, then advected with consistent
+multi-fluid advection:
+
+```julia
+colors = Array{Float32,4}(undef, nx, ny, nz, 2)
+colors[:, :, :, 1] .= 0.4f0
+colors[:, :, :, 2] .= 1f-20
+g = Grid3D(Euler(γ = 1.4f0), U0; dx, dy, dz, bc = :periodic, colors)
+```
+
+The color flux is `F_color = F_mass * X_upwind`, using the same hydro Riemann mass flux and reconstructing
+the intensive fraction in log space before decoding at the face. Use `ncolors(g)` to query the color
+count and `color_fractions(g)` to decode the packed sidecar back to `Float32` fractions. Direct codec
+helpers are also exported: `pack_color_fraction`, `pack_color_log2`, `unpack_color_fraction`, and
+`unpack_color_log2`. CUDA and SIMD color sidecars are not wired yet; the scalar implementation is the
+reference path for those backends to mirror.
 
 ## Performance
 

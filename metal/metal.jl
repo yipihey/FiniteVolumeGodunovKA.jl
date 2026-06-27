@@ -1,13 +1,12 @@
 # ============================================================================================
 # Metal (Apple GPU) backend for FiniteVolumeGodunovKA — 1D / 2D / 3D, at parity with the CUDA backends.
 #
-# ⚠️  UNTESTED — written on a Linux/NVIDIA host where Metal.jl cannot be installed or run.
-#     Metal.jl is macOS/Apple-Silicon only. Each kernel BODY here is identical to the corresponding
-#     CUDA backend (src/backend_cuda{,_2d,_3d}.jl): the same branch-free `_update_dir` physics compiles
-#     for Metal via GPUCompiler in Float32. Only three things differ from CUDA: the launch macro
-#     (`Metal.@metal threads= groups=`), the thread-index intrinsics (`thread_position_in_grid_*d`),
-#     and the array type (`MtlArray`). The dimensional-split scheme, the alternating-Strang `rev`, the
-#     `has_source` guard, and the dynamic-`ch` `prestep` are all mirrored exactly.
+# Metal.jl is macOS/Apple-Silicon only. Each kernel BODY here is identical to the corresponding
+# CUDA backend (src/backend_cuda{,_2d,_3d}.jl): the same branch-free `_update_dir` physics compiles
+# for Metal via GPUCompiler in Float32. Only three things differ from CUDA: the launch macro
+# (`Metal.@metal threads= groups=`), the thread-index intrinsics (`thread_position_in_grid_*d`),
+# and the array type (`MtlArray`). The dimensional-split scheme, the alternating-Strang `rev`, the
+# `has_source` guard, and the dynamic-`ch` `prestep` are all mirrored exactly.
 #
 #     The transpile-to-nvcc backend (`Grid3DCuMarch`) has NO Metal analog — it shells out to `nvcc` to
 #     build a CUDA-C `.so`. The Metal equivalent would transpile to MSL and build via `metallib`; that is
@@ -18,6 +17,7 @@
 #         using FiniteVolumeGodunovKA, Metal
 #         include("metal/metal.jl")
 #         metal_selfcheck_1d(); metal_selfcheck_2d(); metal_selfcheck_3d()   # all must be max|Δ| = 0
+#         metal_selfcheck_3d_colors()                                        # packed UInt16 colors
 #
 # This is intentionally NOT a package dependency (it would break the Linux package's resolution).
 # Productionization on the Mac: move it to a weakdep + package extension `ext/MetalExt.jl`.
@@ -31,6 +31,7 @@ using FiniteVolumeGodunovKA, Metal
 const FV = FiniteVolumeGodunovKA
 import FiniteVolumeGodunovKA: _update_dir, _gidx, _swap, identperm, dirperm, has_source,
                               cons2prim, source, fastspeed_x, maxspeed_x, _halfstep, riemann,
+                              _pack_colors, _update_packed_color, unpack_color_fraction,
                               FVSystem, PLM, HLLC
 
 # Metal thread-index intrinsics return 1-based global grid positions.
@@ -240,6 +241,13 @@ end
 @inline _mwrite3_axis!(U, i, j, k, o, v, ::Val{2}) = _mwrite3!(U, i, j + o, k, v)
 @inline _mwrite3_axis!(U, i, j, k, o, v, ::Val{3}) = _mwrite3!(U, i, j, k + o, v)
 
+@inline _mcread3_axis(C, i, j, k, o, q, nx, ny, nz, bc, ::Val{1}) =
+    @inbounds C[_gidx(i + o, nx, bc), j, k, q]
+@inline _mcread3_axis(C, i, j, k, o, q, nx, ny, nz, bc, ::Val{2}) =
+    @inbounds C[i, _gidx(j + o, ny, bc), k, q]
+@inline _mcread3_axis(C, i, j, k, o, q, nx, ny, nz, bc, ::Val{3}) =
+    @inbounds C[i, j, _gidx(k + o, nz, bc), q]
+
 @inline _maxis_coord(i, j, k, ::Val{1}) = (2 * (i - 1) + 1, j, k)
 @inline _maxis_coord(i, j, k, ::Val{2}) = (i, 2 * (j - 1) + 1, k)
 @inline _maxis_coord(i, j, k, ::Val{3}) = (i, j, 2 * (k - 1) + 1)
@@ -283,18 +291,42 @@ function _mstep3_pair_kernel!(Unew, U, s, r, rs, λ, nx, ny, nz, ::Val{N}, bc, a
     return
 end
 
+function _mcolor3_kernel!(Cnew, C, Unew, U, s, r, rs, λ, nx, ny, nz, ::Val{N}, bc, axis::Val{A}, perm, q) where {N,A}
+    i, j, k = _mtid3()
+    if i <= nx && j <= ny && k <= nz
+        u0 = _mread3_axis(U, i, j, k, 0, nx, ny, nz, bc, axis, Val(N))
+        @inbounds Cnew[i, j, k, q] = _update_packed_color(s, r, rs,
+            _mread3_axis(U, i, j, k, -2, nx, ny, nz, bc, axis, Val(N)),
+            _mread3_axis(U, i, j, k, -1, nx, ny, nz, bc, axis, Val(N)),
+            u0,
+            _mread3_axis(U, i, j, k,  1, nx, ny, nz, bc, axis, Val(N)),
+            _mread3_axis(U, i, j, k,  2, nx, ny, nz, bc, axis, Val(N)),
+            _mcread3_axis(C, i, j, k, -2, q, nx, ny, nz, bc, axis),
+            _mcread3_axis(C, i, j, k, -1, q, nx, ny, nz, bc, axis),
+            (@inbounds C[i, j, k, q]),
+            _mcread3_axis(C, i, j, k,  1, q, nx, ny, nz, bc, axis),
+            _mcread3_axis(C, i, j, k,  2, q, nx, ny, nz, bc, axis),
+            λ, perm, _mread3(Unew, i, j, k, Val(N))[1])
+    end
+    return
+end
+
 mutable struct Grid3DMtl{N,S<:FVSystem,R,RS}
     sys::S; recon::R; rsol::RS
     U::MtlArray{Float32,4}; Unew::MtlArray{Float32,4}; spd::MtlArray{Float32,3}
+    colors::Union{Nothing,MtlArray{UInt16,4}}; colorst::Union{Nothing,MtlArray{UInt16,4}}
     nx::Int; ny::Int; nz::Int; dx::Float32; dy::Float32; dz::Float32; bc::Symbol; cfl::Float32
 end
 function Grid3DMtl(sys::FVSystem, U0::Array{NTuple{N,T},3};
-                   dx, dy, dz, bc::Symbol = :outflow, recon = PLM(), rsol = HLLC(), cfl = 0.4f0) where {N,T}
+                   dx, dy, dz, bc::Symbol = :outflow, recon = PLM(), rsol = HLLC(), cfl = 0.4f0,
+                   colors = nothing) where {N,T}
     nx, ny, nz = size(U0); Uh = Array{Float32,4}(undef, nx, ny, nz, N)
     @inbounds for k in 1:nz, j in 1:ny, i in 1:nx, c in 1:N; Uh[i,j,k,c] = Float32(U0[i,j,k][c]); end
     U = MtlArray(Uh)
+    C, Ct = _pack_colors(colors, (nx, ny, nz))
     Grid3DMtl{N,typeof(sys),typeof(recon),typeof(rsol)}(
         sys, recon, rsol, U, similar(U), Metal.zeros(Float32, nx, ny, nz),
+        C === nothing ? nothing : MtlArray(C), Ct === nothing ? nothing : MtlArray(Ct),
         nx, ny, nz, Float32(dx), Float32(dy), Float32(dz), bc, Float32(cfl))
 end
 @inline _mcfg3(nx, ny, nz) = ((16, 8, 2), (cld(nx, 16), cld(ny, 8), cld(nz, 2)))
@@ -307,6 +339,14 @@ function _mpair_sweep3!(g::Grid3DMtl{N}, dt, axis::Val{A}, perm) where {N,A}
     λ = A == 1 ? Float32(dt)/g.dx : A == 2 ? Float32(dt)/g.dy : Float32(dt)/g.dz
     Metal.@metal threads=thr groups=grp _mstep3_pair_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
         λ, g.nx, g.ny, g.nz, Val(N), Val(g.bc), axis, perm)
+    if g.colors !== nothing
+        cthr, cgrp = _mcfg3(g.nx, g.ny, g.nz)
+        for q in 1:size(g.colors, 4)
+            Metal.@metal threads=cthr groups=cgrp _mcolor3_kernel!(g.colorst, g.colors, g.Unew, g.U,
+                g.sys, g.recon, g.rsol, λ, g.nx, g.ny, g.nz, Val(N), Val(g.bc), axis, perm, q)
+        end
+        g.colors, g.colorst = g.colorst, g.colors
+    end
     g.U, g.Unew = g.Unew, g.U
     return g
 end
@@ -319,6 +359,13 @@ function _mfused_sweep3!(g::Grid3DMtl{N}, dt, axis::Val{A}, perm) where {N,A}
     kern = A == 1 ? _msweepx3_kernel! : A == 2 ? _msweepy3_kernel! : _msweepz3_kernel!
     Metal.@metal threads=thr groups=grp kern(g.Unew, g.U, g.sys, g.recon, g.rsol,
         λ, g.nx, g.ny, g.nz, Val(N), Val(g.bc), perm)
+    if g.colors !== nothing
+        for q in 1:size(g.colors, 4)
+            Metal.@metal threads=thr groups=grp _mcolor3_kernel!(g.colorst, g.colors, g.Unew, g.U,
+                g.sys, g.recon, g.rsol, λ, g.nx, g.ny, g.nz, Val(N), Val(g.bc), axis, perm, q)
+        end
+        g.colors, g.colorst = g.colorst, g.colors
+    end
     g.U, g.Unew = g.Unew, g.U
     return g
 end
@@ -359,6 +406,16 @@ end
 mprimitives_3d(g::Grid3DMtl{N}) where {N} =
     (Uh = Array(g.U); [cons2prim(g.sys, ntuple(c -> Uh[i,j,k,c], Val(N))) for i in 1:g.nx, j in 1:g.ny, k in 1:g.nz])
 
+function mcolor_fractions_3d(g::Grid3DMtl)
+    g.colors === nothing && return nothing
+    C = Array(g.colors)
+    F = Array{Float32}(undef, size(C))
+    @inbounds for I in eachindex(C)
+        F[I] = unpack_color_fraction(C[I])
+    end
+    return F
+end
+
 # =============================== validation (run on a Mac) ===============================
 # Each Metal backend must be bit-identical to its scalar reference (same branch-free physics, Float32).
 
@@ -393,4 +450,27 @@ function metal_selfcheck_3d()
     Wc = FV.primitives(gsc); Wm = mprimitives_3d(gm)
     md = maximum(maximum(abs.(Wc[i,j,k] .- Wm[i,j,k])) for i in 1:n, j in 1:n, k in 1:n)
     println("Metal ≡ scalar Grid3D max|Δ| = ", md, md == 0f0 ? "  ✓ bit-identical" : "  (investigate)"); md
+end
+
+function metal_selfcheck_3d_colors(; n = 16)
+    s = FV.Euler(γ = 1.4f0); d = 1f0 / n
+    U0 = [FV.prim2cons(s, (1f0 + 0.1f0 * sinpi(2f0 * Float32(i + j + k) / n),
+                            0.3f0, 0.2f0, 0.1f0, 1f0)) for i in 1:n, j in 1:n, k in 1:n]
+    C = Array{Float32,4}(undef, n, n, n, 2)
+    C[:, :, :, 1] .= 0.4f0
+    C[:, :, :, 2] .= 1f-18
+    gsc = FV.Grid3D(s, copy(U0); dx=d, dy=d, dz=d, bc=:periodic, recon=PLM(), rsol=HLLC(), colors=C)
+    gm = Grid3DMtl(s, copy(U0); dx=d, dy=d, dz=d, bc=:periodic, recon=PLM(), rsol=HLLC(), colors=C)
+    for step in 1:3
+        FV.step!(gsc, 0.03f0 * d; rev=isodd(step))
+        mstep3d!(gm, 0.03f0 * d; rev=isodd(step))
+    end
+    Metal.synchronize()
+    Xc = FV.color_fractions(gsc)
+    Xm = mcolor_fractions_3d(gm)
+    md = maximum(abs, Xc .- Xm)
+    pd = maximum(abs, Int.(gsc.colors) .- Int.(Array(gm.colors)))
+    println("Metal ≡ scalar Grid3D packed colors max|ΔX| = ", md,
+            " packed Δ = ", pd, (md == 0f0 && pd == 0) ? "  ✓ bit-identical" : "  (investigate)")
+    return md
 end
