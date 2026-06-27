@@ -386,6 +386,36 @@ if CUDA.functional()
             for s in (Euler(γ=1.4f0), GLMMHD(γ=5f0/3f0, ch=2f0))
                 @test transpile_selfcheck(s) == 0f0          # transpiled C physics ≡ Julia, bit-exact
             end
+
+            @testset "EulerColors{$NC}: passive color/species advection" for NC in (1, 2, 3)
+                @test transpile_selfcheck(EulerColors{NC}(γ=5f0/3f0)) == 0f0   # unrolled color C ≡ Julia, bit-exact
+                γc = 5f0/3f0; nc3 = (48, 16, 16); dxc = 1f0/nc3[1]
+                # smooth periodic hydro IC; colors X₁=0.42 (uniform), X₂=1-X₁+blob, X₃=blob' (trace ~1e-20)
+                mk(i,j,k) = begin
+                    x=2f0π*(i-1)/nc3[1]; y=2f0π*(j-1)/nc3[2]; z=2f0π*(k-1)/nc3[3]
+                    ρ=1f0+0.3f0*sin(x)*cos(y)+0.2f0*sin(z); u=0.6f0+0.05f0*sin(y); v=0.04f0*cos(z); w=0.03f0*sin(x)
+                    P=1f0+0.1f0*cos(x)*sin(y); E=P/(γc-1f0)+0.5f0*ρ*(u*u+v*v+w*w)
+                    blob=0.2f0*exp(-(Float32(i-24)^2+Float32(j-8)^2+Float32(k-8)^2)/8f0)
+                    (ρ,ρ*u,ρ*v,ρ*w,E, ρ*0.42f0, ρ*(0.58f0+blob), ρ*(1f-20+blob*1f-20))
+                end
+                Uc = [ mk(i,j,k)[1:5+NC] for i in 1:nc3[1], j in 1:nc3[2], k in 1:nc3[3] ]
+                Uh = [ mk(i,j,k)[1:5]     for i in 1:nc3[1], j in 1:nc3[2], k in 1:nc3[3] ]
+                gc = Grid3DCuMarch(EulerColors{NC}(γ=γc), Uc; dx=dxc)
+                gh = Grid3DCuMarch(Euler(γ=γc), Uh; dx=dxc)
+                dt = 0.4f0*dxc/2f0
+                for _ in 1:6; FV.run_ctu!(gc, dt, 1); FV.run_ctu!(gh, dt, 1); end
+                VOL=prod(nc3); blk(R,c)=reshape(Array(R)[(c-1)*VOL+1:c*VOL], nc3...)
+                rel(a,b)=maximum(abs.(Float64.(a).-Float64.(b)))/(maximum(abs.(Float64.(b)))+eps())
+                # colors are PASSIVE: the 5 hydro vars track a plain Euler run to f32 round-off
+                for c in 1:5; @test rel(blk(gc.R,c), blk(gh.R,c)) < 1f-5; end
+                ρ = blk(gc.R,1)
+                @test maximum(abs.((blk(gc.R,6)./ρ) .- 0.42f0)) < 1f-5      # uniform color stays uniform (CMA)
+                NC >= 2 && @test maximum(abs.(((blk(gc.R,6).+blk(gc.R,7))./ρ) .- 1f0)) < 1f-4  # ΣX preserved
+                for c in 6:5+NC                                              # conservation + finiteness per color
+                    @test all(isfinite, blk(gc.R,c))
+                    @test isapprox(sum(Float64.(blk(gc.R,c))), sum(Float64(Uc[i,j,k][c]) for i in 1:nc3[1],j in 1:nc3[2],k in 1:nc3[3]); rtol=1f-4)
+                end
+            end
             s = Euler(γ=1.4f0); n = 32; d = 1f0/n
             U0 = [prim2cons(s, (1f0+0.1f0*sinpi(2f0*Float32(i+j+k)/n), 0.2f0,0.1f0,0.1f0, 1f0)) for i in 1:n, j in 1:n, k in 1:n]
             g = Grid3DCuMarch(s, U0; dx=d); FV.run!(g, 0.2f0*d, 20); W = FV.primitives(g)
