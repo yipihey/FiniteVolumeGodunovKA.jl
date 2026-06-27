@@ -81,6 +81,35 @@ end
 # HLLD (Miyoshi-Kusano) for GLM-MHD, a 1:1 transcription of src/riemann_mhd.jl. NOT generic — keyed to the
 # GLMMHD layout W=(ρ,u,v,w,P,Bx,By,Bz,ψ), PRM=(γ,ch,…) — so it is emitted only for `GLMMHD` and selected
 # via `RSOLVE` (Euler keeps the generic `llf`). Branch-free; bit-validated against the Julia solver.
+# HLLC (Toro) contact-restoring Riemann solver for Euler / EulerColors — a 1:1 transcription of
+# the generic `riemann(::HLLC, …)` in src/riemann.jl, generalized to NV: passive colours (slots
+# 5…NV-1, primitive = mass fraction xᵢ) ride the contact, star colour density = q·xᵢ.  Far less
+# diffusive than LLF (resolves the contact discontinuity), at the cost of one extra wave estimate.
+# γ = PRM[0]; sound speed c = sqrt(γP/ρ).  Robust for smooth/physical states (mL−mR = −2ρc ≠ 0).
+const _HLLC_C = raw"""
+__device__ void hllc(const float* WL,const float* WR,float* F,const float* PRM){
+  float rL=WL[0],uL=WL[1],vL=WL[2],wL=WL[3],pL=WL[4];
+  float rR=WR[0],uR=WR[1],vR=WR[2],wR=WR[3],pR=WR[4];
+  float cL=sqrtf(PRM[0]*pL/rL), cR=sqrtf(PRM[0]*pR/rR);
+  float SL=fminf(uL-cL,uR-cR), SR=fmaxf(uL+cL,uR+cR);
+  float FL[NV],FR[NV],UL[NV],UR[NV];
+  physflux_x(WL,FL,PRM); physflux_x(WR,FR,PRM); prim2cons(WL,UL,PRM); prim2cons(WR,UR,PRM);
+  float mL=rL*(SL-uL), mR=rR*(SR-uR);
+  float Ss=(pR-pL+mL*uL-mR*uR)/(mL-mR);
+  float qL=mL/(SL-Ss), eL=UL[4]/rL+(Ss-uL)*(Ss+pL/mL);
+  float qR=mR/(SR-Ss), eR=UR[4]/rR+(Ss-uR)*(Ss+pR/mR);
+  float UsL[NV],UsR[NV];
+  UsL[0]=qL; UsL[1]=qL*Ss; UsL[2]=qL*vL; UsL[3]=qL*wL; UsL[4]=qL*eL;
+  UsR[0]=qR; UsR[1]=qR*Ss; UsR[2]=qR*vR; UsR[3]=qR*wR; UsR[4]=qR*eR;
+  for(int c=5;c<NV;c++){ UsL[c]=qL*WL[c]; UsR[c]=qR*WR[c]; }
+  for(int c=0;c<NV;c++){
+    float fsl=FL[c]+SL*(UsL[c]-UL[c]);
+    float fsr=FR[c]+SR*(UsR[c]-UR[c]);
+    F[c]=(SL>=0.f)?FL[c]:((Ss>=0.f)?fsl:((SR>=0.f)?fsr:FR[c]));
+  }
+}
+"""
+
 const _HLLD_C = raw"""
 __host__ __device__ float _fastmhd(float g,float r,float p,float Bx,float By,float Bz){
   float a2=g*p/r, b2=(Bx*Bx+By*By+Bz*Bz)/r, bx2=Bx*Bx/r;
@@ -128,7 +157,7 @@ extern "C" void fv_hlld(const float* WL,const float* WR,float* F,const float* P)
 """
 
 "`gen_cuda_c(sys) -> String`: the full CUDA-C source emitted from the system's `@fvsystem` stencil."
-function gen_cuda_c(sys::FVSystem)
+function gen_cuda_c(sys::FVSystem; riemann::Symbol = :llf)
     m = _fvmeta(sys); NV = m.nvars
     pidx = Dict(p => i-1 for (i,p) in enumerate(m.params)); physset = Set(keys(m.phys))
     want = [:cons2prim, :prim2cons, :physflux_x, :maxspeed_x]
@@ -532,9 +561,12 @@ extern "C" void fv_run_ctumh(float* R,float* O,int nx,int ny,int nz,float lam,co
   if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
 """, "NV" => string(NV), "ZZTBZ" => string(NV <= 5 ? 8 : 4), "ZZMB" => string(NV <= 5 ? 16 : 8))
-    # the f32 kernels call RSOLVE: hand-written HLLD for GLM-MHD (scheme-matched to the .cu), else LLF.
+    # the f32 kernels call RSOLVE: hand-written HLLD for GLM-MHD (scheme-matched to the .cu); for the
+    # hydro systems either the generic LLF (default) or the contact-restoring HLLC (riemann=:hllc).
     ismhd  = sys isa GLMMHD
-    rblock = (ismhd ? _HLLD_C : "") * "#define RSOLVE " * (ismhd ? "hlld" : "llf") * "\n"
+    usehllc = (!ismhd) && (riemann === :hllc)
+    rblock = (ismhd ? _HLLD_C : (usehllc ? _HLLC_C : "")) *
+             "#define RSOLVE " * (ismhd ? "hlld" : (usehllc ? "hllc" : "llf")) * "\n"
     "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n#define NV $NV\n\n" *
     join(protos, "\n") * "\n\n" * join(defs, "\n") *
     _genswap("swap_y", m.vidx, 2) * _genswap("swap_z", m.vidx, 3) *
@@ -565,8 +597,8 @@ function _glob(pat)
 end
 
 "`build_cuda(sys; sm) -> so_path`: emit + nvcc-compile the system to a shared library (cached by hash)."
-function build_cuda(sys::FVSystem; sm::String = "sm_86")
-    src = gen_cuda_c(sys); tag = string(hash((typeof(sys), sm)); base = 16)
+function build_cuda(sys::FVSystem; sm::String = "sm_86", riemann::Symbol = :llf)
+    src = gen_cuda_c(sys; riemann = riemann); tag = string(hash((typeof(sys), sm, riemann)); base = 16)
     dir = mktempdir(; cleanup = false); cu = joinpath(dir, "fv_$tag.cu"); so = joinpath(dir, "libfv_$tag.so")
     write(cu, src)
     run(`$(_find_nvcc()) -O3 -arch=$sm --use_fast_math --shared -Xcompiler -fPIC -o $so $cu`)
@@ -583,9 +615,9 @@ mutable struct Grid3DCuMarch{N,S<:FVSystem}
     nx::Int; ny::Int; nz::Int; dx::Float32
 end
 
-function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::String = "sm_86") where {N}
+function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::String = "sm_86", riemann::Symbol = :llf) where {N}
     nx, ny, nz = size(U0); VOL = nx*ny*nz
-    lib = Libdl.dlopen(build_cuda(sys; sm = sm))
+    lib = Libdl.dlopen(build_cuda(sys; sm = sm, riemann = riemann))
     Uh = Vector{Float32}(undef, N*VOL)
     @inbounds for kk in 0:nz-1, jj in 0:ny-1, ii in 0:nx-1
         q = (kk*ny + jj)*nx + ii + 1; u = U0[ii+1, jj+1, kk+1]
