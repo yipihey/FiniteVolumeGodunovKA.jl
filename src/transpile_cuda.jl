@@ -110,6 +110,24 @@ __device__ void hllc(const float* WL,const float* WR,float* F,const float* PRM){
 }
 """
 
+# "Local PPM" reconstruction — the monotonized single-zone CW84 (Colella & Woodward 1984) parabolic
+# interface value, 3-point / 1-ghost stencil, transcribed from the GLMMHDTurb reference (spike_25d.cu
+# `ppm1`).  sgn>0 → +face (qr), sgn<0 → −face (ql).  3rd-order-accurate edge value where smooth,
+# monotonized at extrema/steep gradients — sharper than the 2nd-order PLM slope it replaces.
+const _PPM1_C = raw"""
+__device__ __forceinline__ float ppm1(float qm,float q0,float qp,float sgn){
+  float d=0.25f*(qp-qm), cu=(qm-2.f*q0+qp)*(1.f/6.f);
+  float qr=q0+d-cu, ql=q0-d-cu;
+  if((qr-q0)*(q0-ql)<=0.f){ qr=q0; ql=q0; }
+  else { float dqe=qr-ql, d6=6.f*(q0-0.5f*(ql+qr));
+    if(dqe*d6 >  dqe*dqe) ql=3.f*q0-2.f*qr;
+    if(dqe*d6 < -dqe*dqe) qr=3.f*q0-2.f*ql; }
+  return sgn>0.f?qr:ql; }
+__device__ __forceinline__ __half ppm1h(__half m,__half z,__half p,float sgn){
+  return __float2half(ppm1(__half2float(m),__half2float(z),__half2float(p),sgn)); }
+#define RECON_PPM
+"""
+
 const _HLLD_C = raw"""
 __host__ __device__ float _fastmhd(float g,float r,float p,float Bx,float By,float Bz){
   float a2=g*p/r, b2=(Bx*Bx+By*By+Bz*Bz)/r, bx2=Bx*Bx/r;
@@ -157,7 +175,7 @@ extern "C" void fv_hlld(const float* WL,const float* WR,float* F,const float* P)
 """
 
 "`gen_cuda_c(sys) -> String`: the full CUDA-C source emitted from the system's `@fvsystem` stencil."
-function gen_cuda_c(sys::FVSystem; riemann::Symbol = :llf)
+function gen_cuda_c(sys::FVSystem; riemann::Symbol = :llf, recon::Symbol = :plm)
     m = _fvmeta(sys); NV = m.nvars
     pidx = Dict(p => i-1 for (i,p) in enumerate(m.params)); physset = Set(keys(m.phys))
     want = [:cons2prim, :prim2cons, :physflux_x, :maxspeed_x]
@@ -224,7 +242,12 @@ extern "C" void fv_run(float* R, float* O, int nx,int ny,int nz, float lam, cons
   cudaDeviceSynchronize(); }
 // ---- genuinely 2nd-order path (MUSCL + SSP-RK2): Hancock-free PLM reconstruction + LLF, RK2 in time ----
 __device__ void recon(const float* Wm,const float* W0,const float* Wp,float* WL,float* WR){
-  for(int c=0;c<NV;c++){ float d=mc(W0[c]-Wm[c],Wp[c]-W0[c]); WL[c]=W0[c]-0.5f*d; WR[c]=W0[c]+0.5f*d; } }
+#ifdef RECON_PPM
+  for(int c=0;c<NV;c++){ WL[c]=ppm1(Wm[c],W0[c],Wp[c],-1.f); WR[c]=ppm1(Wm[c],W0[c],Wp[c],1.f); }
+#else
+  for(int c=0;c<NV;c++){ float d=mc(W0[c]-Wm[c],Wp[c]-W0[c]); WL[c]=W0[c]-0.5f*d; WR[c]=W0[c]+0.5f*d; }
+#endif
+}
 __device__ void fluxdiff_rk(const float* const W[5],const float* PRM,float* out){
   float WLm[NV],WRm[NV],WL0[NV],WR0[NV],WLp[NV],WRp[NV];
   recon(W[0],W[1],W[2],WLm,WRm); recon(W[1],W[2],W[3],WL0,WR0); recon(W[2],W[3],W[4],WLp,WRp);
@@ -335,7 +358,12 @@ __device__ void compute_dU(const __half* Ws,int lx,int ly,int lz,float lam,const
   for(int c=0;c<NV;c++) dU[c]=__float2half(d[c]*-0.5f*lam); }
 // one-sided PLM reconstruction (only the face we need; side 0=L i.e. -, 1=R i.e. +).
 __device__ void recon_one(const float* Wm,const float* W0,const float* Wp,int side,float* out){
-  float s=(side?0.5f:-0.5f); for(int c=0;c<NV;c++) out[c]=W0[c]+s*mc(W0[c]-Wm[c],Wp[c]-W0[c]); }
+#ifdef RECON_PPM
+  float sg=(side?1.f:-1.f); for(int c=0;c<NV;c++) out[c]=ppm1(Wm[c],W0[c],Wp[c],sg);
+#else
+  float s=(side?0.5f:-0.5f); for(int c=0;c<NV;c++) out[c]=W0[c]+s*mc(W0[c]-Wm[c],Wp[c]-W0[c]);
+#endif
+}
 // predicted face state of Ws-local cell (lx,ly,lz): PLM recon along dir, evolved by stored dUcell. side 0=L,1=R.
 __device__ void predicted_face(const __half* Ws,int lx,int ly,int lz,int dir,int side,const __half* dUcell,const float* PRM,float* out){
   int ex=(dir==0),ey=(dir==1),ez=(dir==2);
@@ -482,9 +510,19 @@ __device__ __half mc_h(__half a,__half b){ __half z=__float2half(0.f);
   if(a*b<=z) return z; __half s=(a>z)?__float2half(1.f):__float2half(-1.f);
   return s*__hmin(__float2half(0.5f)*__habs(a+b),__hmin(__float2half(2.f)*__habs(a),__float2half(2.f)*__habs(b))); }
 __device__ void recon_one_h(const __half* Wm,const __half* W0,const __half* Wp,int side,__half* out){
-  __half h=side?__float2half(0.5f):__float2half(-0.5f); for(int c=0;c<NV;c++) out[c]=W0[c]+h*mc_h(W0[c]-Wm[c],Wp[c]-W0[c]); }
+#ifdef RECON_PPM
+  float sg=(side?1.f:-1.f); for(int c=0;c<NV;c++) out[c]=ppm1h(Wm[c],W0[c],Wp[c],sg);
+#else
+  __half h=side?__float2half(0.5f):__float2half(-0.5f); for(int c=0;c<NV;c++) out[c]=W0[c]+h*mc_h(W0[c]-Wm[c],Wp[c]-W0[c]);
+#endif
+}
 __device__ void recon_h(const __half* Wm,const __half* W0,const __half* Wp,__half* WL,__half* WR){
-  __half h=__float2half(0.5f); for(int c=0;c<NV;c++){ __half d=mc_h(W0[c]-Wm[c],Wp[c]-W0[c]); WL[c]=W0[c]-h*d; WR[c]=W0[c]+h*d; } }
+#ifdef RECON_PPM
+  for(int c=0;c<NV;c++){ WL[c]=ppm1h(Wm[c],W0[c],Wp[c],-1.f); WR[c]=ppm1h(Wm[c],W0[c],Wp[c],1.f); }
+#else
+  __half h=__float2half(0.5f); for(int c=0;c<NV;c++){ __half d=mc_h(W0[c]-Wm[c],Wp[c]-W0[c]); WL[c]=W0[c]-h*d; WR[c]=W0[c]+h*d; }
+#endif
+}
 __device__ void llf_h(const __half* WL,const __half* WR,__half* F,const __half* PRM){
   __half UL[NV],UR[NV],FL[NV],FR[NV]; prim2cons_h(WL,UL,PRM); prim2cons_h(WR,UR,PRM); physflux_x_h(WL,FL,PRM); physflux_x_h(WR,FR,PRM);
   __half s=__hmax(maxspeed_x_h(WL,PRM),maxspeed_x_h(WR,PRM)),h=__float2half(0.5f);
@@ -567,11 +605,14 @@ extern "C" void fv_run_ctumh(float* R,float* O,int nx,int ny,int nz,float lam,co
     usehllc = (!ismhd) && (riemann === :hllc)
     rblock = (ismhd ? _HLLD_C : (usehllc ? _HLLC_C : "")) *
              "#define RSOLVE " * (ismhd ? "hlld" : (usehllc ? "hllc" : "llf")) * "\n"
+    # reconstruction block: emit ppm1/ppm1h + `#define RECON_PPM` to switch recon/recon_one (and the
+    # f16 twins) from PLM to local PPM.  Must precede `fixed` (which defines recon).  GLM-MHD keeps PLM.
+    cblock = ((!ismhd) && recon === :ppm) ? _PPM1_C : ""
     "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n#define NV $NV\n\n" *
     join(protos, "\n") * "\n\n" * join(defs, "\n") *
     _genswap("swap_y", m.vidx, 2) * _genswap("swap_z", m.vidx, 3) *
     _genswap("swap_y_h", m.vidx, 2; half = true) * _genswap("swap_z_h", m.vidx, 3; half = true) *
-    "\n" * tests * rblock * fixed
+    "\n" * tests * rblock * cblock * fixed
 end
 
 function _find_nvcc()
@@ -597,8 +638,8 @@ function _glob(pat)
 end
 
 "`build_cuda(sys; sm) -> so_path`: emit + nvcc-compile the system to a shared library (cached by hash)."
-function build_cuda(sys::FVSystem; sm::String = "sm_86", riemann::Symbol = :llf)
-    src = gen_cuda_c(sys; riemann = riemann); tag = string(hash((typeof(sys), sm, riemann)); base = 16)
+function build_cuda(sys::FVSystem; sm::String = "sm_86", riemann::Symbol = :llf, recon::Symbol = :plm)
+    src = gen_cuda_c(sys; riemann = riemann, recon = recon); tag = string(hash((typeof(sys), sm, riemann, recon)); base = 16)
     dir = mktempdir(; cleanup = false); cu = joinpath(dir, "fv_$tag.cu"); so = joinpath(dir, "libfv_$tag.so")
     write(cu, src)
     run(`$(_find_nvcc()) -O3 -arch=$sm --use_fast_math --shared -Xcompiler -fPIC -o $so $cu`)
@@ -615,9 +656,9 @@ mutable struct Grid3DCuMarch{N,S<:FVSystem}
     nx::Int; ny::Int; nz::Int; dx::Float32
 end
 
-function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::String = "sm_86", riemann::Symbol = :llf) where {N}
+function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::String = "sm_86", riemann::Symbol = :llf, recon::Symbol = :plm) where {N}
     nx, ny, nz = size(U0); VOL = nx*ny*nz
-    lib = Libdl.dlopen(build_cuda(sys; sm = sm, riemann = riemann))
+    lib = Libdl.dlopen(build_cuda(sys; sm = sm, riemann = riemann, recon = recon))
     Uh = Vector{Float32}(undef, N*VOL)
     @inbounds for kk in 0:nz-1, jj in 0:ny-1, ii in 0:nx-1
         q = (kk*ny + jj)*nx + ii + 1; u = U0[ii+1, jj+1, kk+1]
