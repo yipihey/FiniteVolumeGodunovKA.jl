@@ -452,6 +452,288 @@ function metal_selfcheck_3d()
     println("Metal ≡ scalar Grid3D max|Δ| = ", md, md == 0f0 ? "  ✓ bit-identical" : "  (investigate)"); md
 end
 
+# ============================================================================================
+# DUAL-ENERGY + f16-STORAGE Metal path (cold-gas cosmology, halved grid buffer) — M5-VALIDATION-READY.
+#
+# STATUS: written to MIRROR the CUDA de16/de16s logic (src/transpile_cuda.jl: k_ctus_de16 / k_ctus_de16s,
+# ld_de16s_U / st_de16s_U, the Enzo dual-energy switch + PdV, GE_SCALE) AND the Metal split-sweep scheme
+# above; the PHYSICS (dual-energy switch, GE_SCALE lift/unlift, f16 cold-gas survival) is validated on the
+# CPU scalar reference (see test/cpu_de_validate.jl + metal_selfcheck_de16 below). The @metal kernels here
+# CANNOT be GPU-compiled on the Linux/NVIDIA dev host — they are for the user to run on an M5 (Apple Silicon).
+# NOT claimed validated on Metal hardware: run `metal_selfcheck_de16()` on the M5 to validate.
+#
+# THE PORT (faithful, NOT a CTU port): the CUDA backend uses a fused tiled CTU (k_ctus_de16); the Metal
+# backend uses the Metal-native dimensionally-split Strang sweeps above. The split sweeps ALREADY advect the
+# dual energy Ge (slot 6) and the colours through the generic FVSystem contract (physflux_x slot 6 = Ge*u),
+# because EulerDE.cons2prim gives p = (gamma-1)*Ge so the Riemann fluxes use the dual-energy pressure (NEVER
+# the cancelling E-1/2 rho v^2). What the split path lacks vs the CTU — and what these kernels ADD per cell
+# AFTER the full Strang step — is the two NON-conservative pieces the CUDA kernel applies per substep:
+#     (1) PdV work on Ge:   Ge -= dt*P*(div v)        (P = (gamma-1)*Ge, div v from central differences)
+#     (2) the Enzo dual-energy switch:  if (E-KE)/E > eta -> eint = (E-KE)/rho, Ge <- rho*eint (warm, trust E)
+#                                       else              -> keep evolved Ge, E <- KE + Ge      (cold, trust Ge)
+# This is the SAME physics (cold-gas-safe, dual energy) with the split integrator — the faithful Metal
+# equivalent of the CUDA de16 path, applied once per Strang step (the split analog of the CTU per-substep).
+#
+# f16 COMPUTE + f16 STORAGE (Grid3DMtlDE16, MtlArray{Float16}): mirrors k_ctus_de16s + ld_de16s_U/st_de16s_U.
+# The global U/Unew buffers are MtlArray{Float16} (HALF the bytes of the f32 Grid3DMtl). The GE_SCALE
+# convention (the SAME as the CUDA storage layout) — energies lifted, everything else raw:
+#     slot 1   rho          stored RAW       (rho~0.17, normal in f16)
+#     slots2-4 ru,rv,rw     stored RAW       (|ru|~2.5e-4 > f16 subnormal floor ~6e-5)
+#     slot 5   E            stored E*GE_SCALE (cold E~2e-7 is f16-subnormal; lift to normal)
+#     slot 6   Ge           stored Ge*GE_SCALE (cold Ge=rho*eint~1.2e-8 << subnormal floor; lift ESSENTIAL)
+#     slots7.. rXi          stored RAW       (colour rho*X~0.05*rho, normal-valued; trace colours unsupported)
+# Each step: ld (f16->f32, energies /GE_SCALE) -> f32 split sweeps -> PdV+switch -> st (f32->f16, energies
+# *GE_SCALE). The sweep kernels run with the contract physics (element-type-generic); the energy slots only
+# ever leave f16's subnormal danger zone via GE_SCALE. `read_conserved_de16` is the read-back analog of CUDA
+# `read_conserved_f32` (un-lifts the energies).
+#
+# Build/validate on a Mac (M5):
+#     using FiniteVolumeGodunovKA, Metal; include("metal/metal.jl")
+#     metal_selfcheck_de16()            # cold IC, f16-storage dual energy: no NaN + eint preserved + halved mem
+#     metal_selfcheck_de16_colors()     # + an advected colour sphere (EulerDEColors{1})
+# ============================================================================================
+
+import FiniteVolumeGodunovKA: EulerDE, EulerDEColors, LLF
+const MTL_GE_SCALE = 1f7   # default GE_SCALE (mirrors the CUDA ge_scale=1e7 used in the f16-storage tests)
+
+# COMPUTE-IN-f32, STORE-IN-f16 with the buffer ALWAYS GE_SCALE-LIFTED (the EXACT CUDA de16s convention).
+# CRITICAL: the cold energies are un-lifted ONLY into f32 registers, NEVER back into the Float16 buffer —
+# a cold Ge~1.2e-8 written to Float16 flushes to 0 (subnormal). So `ld_de16s_U`/`st_de16s_U` keep the f16
+# global buffer permanently lifted (energies ×GE_SCALE, normal-valued in f16) and do the /GE_SCALE only into
+# `float` registers inside each kernel. These read/write helpers mirror that: read f16(lifted) → f32(true),
+# write f32(true) → f16(lifted). Energies = slots 5,6; ρ/momenta/colours are raw (already f16-normal).
+@inline _ld_de16s(U, i, j, k, igs::Float32, ::Val{N}) where {N} =
+    ntuple(c -> (c == 5 || c == 6) ? @inbounds(Float32(U[i, j, k, c])) * igs : @inbounds(Float32(U[i, j, k, c])), Val(N))
+@inline function _st_de16s!(U, i, j, k, v::NTuple{N,Float32}, gs::Float32) where {N}
+    ntuple(c -> (@inbounds(U[i, j, k, c] = Float16((c == 5 || c == 6) ? v[c] * gs : v[c])); nothing), Val(N))
+    nothing
+end
+# velocity component from a lifted-buffer cell (slots 2,3,4 / ρ are raw, so no un-lift needed for u=ρu/ρ).
+@inline _vel_de16s(U, i, j, k, comp) = Float32(@inbounds U[i, j, k, comp]) / Float32(@inbounds U[i, j, k, 1])
+
+# --- the Enzo dual-energy switch + PdV (Float32), applied per cell AFTER the full Strang step. Mirrors the
+#     tail of k_ctus_de16 (transpile_cuda.jl): PdV on Ge, then the eta switch syncing Ge<->E. --------------
+# `divv_dx` = dx*(div v) from central differences; lam = dt/dx folds the 1/dx (0.5*lam central diff -> dt).
+@inline function _mde_pdv_switch(s, Un::NTuple{NV,Float32}, divv_dx::Float32, lam::Float32) where {NV}
+    rho = Un[1]; mx = Un[2]; my = Un[3]; mz = Un[4]; E = Un[5]; Ge = Un[6]
+    P  = (s.γ - 1f0) * Ge
+    Ge = Ge - lam * P * divv_dx                                   # PdV: -dt*P*(div v)
+    irho = inv(rho); ke = 0.5f0 * irho * (mx*mx + my*my + mz*mz)
+    ratio = E > 0f0 ? (E - ke) / E : -1f0
+    if ratio > s.η
+        Ged = E - ke; Ge = Ged > 0f0 ? Ged : Ge; E = ke + Ge       # warm/shocked: trust E
+    else
+        E = ke + Ge                                                # cold: trust evolved Ge
+    end
+    ntuple(c -> c == 5 ? E : c == 6 ? Ge : Un[c], Val(NV))
+end
+
+# Metal kernel: PdV + Enzo switch over the whole grid (compute f32, store f16, buffer stays lifted). Reads
+# the lifted f16 buffer, un-lifts into f32, applies PdV+switch, re-lifts the (E,Ge) on store. bc via _gidx.
+function _mde_switch3_kernel!(U, s, igs, gs, lam, nx, ny, nz, ::Val{N}, bc) where {N}
+    i, j, k = _mtid3()
+    if i <= nx && j <= ny && k <= nz
+        u0 = _ld_de16s(U, i, j, k, igs, Val(N))
+        uxp = _vel_de16s(U, _gidx(i+1,nx,bc), j, k, 2); uxm = _vel_de16s(U, _gidx(i-1,nx,bc), j, k, 2)
+        vyp = _vel_de16s(U, i, _gidx(j+1,ny,bc), k, 3); vym = _vel_de16s(U, i, _gidx(j-1,ny,bc), k, 3)
+        wzp = _vel_de16s(U, i, j, _gidx(k+1,nz,bc), 4); wzm = _vel_de16s(U, i, j, _gidx(k-1,nz,bc), 4)
+        divv_dx = 0.5f0 * ((uxp - uxm) + (vyp - vym) + (wzp - wzm))
+        _st_de16s!(U, i, j, k, _mde_pdv_switch(s, u0, divv_dx, lam), gs)
+    end
+    return
+end
+
+# f32-compute / f16-store dual-energy sweep kernels (one per axis), buffer stays lifted. Identical structure
+# to _msweepx3/y3/z3 but reading f16(lifted)->f32(true), computing _update_dir in Float32, writing f16(lifted).
+# The contract advects Ge (slot 6) and the colours (slots 7..NV) via physflux_x; p=(gamma-1)Ge from cons2prim.
+function _mde16_sweepx3_kernel!(Unew, U, s, r, rs, lam, igs, gs, nx, ny, nz, ::Val{N}, bc, perm) where {N}
+    i, j, k = _mtid3()
+    if i <= nx && j <= ny && k <= nz
+        _st_de16s!(Unew, i, j, k, _update_dir(s, r, rs,
+            _ld_de16s(U,_gidx(i-2,nx,bc),j,k,igs,Val(N)), _ld_de16s(U,_gidx(i-1,nx,bc),j,k,igs,Val(N)), _ld_de16s(U,i,j,k,igs,Val(N)),
+            _ld_de16s(U,_gidx(i+1,nx,bc),j,k,igs,Val(N)), _ld_de16s(U,_gidx(i+2,nx,bc),j,k,igs,Val(N)), lam, perm), gs)
+    end
+    return
+end
+function _mde16_sweepy3_kernel!(Unew, U, s, r, rs, lam, igs, gs, nx, ny, nz, ::Val{N}, bc, perm) where {N}
+    i, j, k = _mtid3()
+    if i <= nx && j <= ny && k <= nz
+        _st_de16s!(Unew, i, j, k, _update_dir(s, r, rs,
+            _ld_de16s(U,i,_gidx(j-2,ny,bc),k,igs,Val(N)), _ld_de16s(U,i,_gidx(j-1,ny,bc),k,igs,Val(N)), _ld_de16s(U,i,j,k,igs,Val(N)),
+            _ld_de16s(U,i,_gidx(j+1,ny,bc),k,igs,Val(N)), _ld_de16s(U,i,_gidx(j+2,ny,bc),k,igs,Val(N)), lam, perm), gs)
+    end
+    return
+end
+function _mde16_sweepz3_kernel!(Unew, U, s, r, rs, lam, igs, gs, nx, ny, nz, ::Val{N}, bc, perm) where {N}
+    i, j, k = _mtid3()
+    if i <= nx && j <= ny && k <= nz
+        _st_de16s!(Unew, i, j, k, _update_dir(s, r, rs,
+            _ld_de16s(U,i,j,_gidx(k-2,nz,bc),igs,Val(N)), _ld_de16s(U,i,j,_gidx(k-1,nz,bc),igs,Val(N)), _ld_de16s(U,i,j,k,igs,Val(N)),
+            _ld_de16s(U,i,j,_gidx(k+1,nz,bc),igs,Val(N)), _ld_de16s(U,i,j,_gidx(k+2,nz,bc),igs,Val(N)), lam, perm), gs)
+    end
+    return
+end
+
+# Wavespeed kernel for the dual-energy grid (compute f32; maxspeed_x via cons2prim -> p=(gamma-1)Ge; LLF-only).
+# Reads the lifted f16 buffer, un-lifts into f32. Summed over the three axes like the CUDA k_speed_de16s.
+function _mde_speed3_kernel!(spd, U, s, igs, nx, ny, nz, ::Val{N}, py, pz) where {N}
+    i, j, k = _mtid3()
+    if i <= nx && j <= ny && k <= nz
+        W = cons2prim(s, _ld_de16s(U, i, j, k, igs, Val(N)))
+        @inbounds spd[i, j, k] = maxspeed_x(s, W) + maxspeed_x(s, _swap(W, py)) + maxspeed_x(s, _swap(W, pz))
+    end
+    return
+end
+
+# --- f16-STORAGE dual-energy 3D grid: MtlArray{Float16} U/Unew (HALF the f32 bytes), GE_SCALE-lifted energies.
+mutable struct Grid3DMtlDE16{N,T,S<:FVSystem,R,RS}
+    sys::S; recon::R; rsol::RS
+    U::MtlArray{T,4}; Unew::MtlArray{T,4}; spd::MtlArray{Float32,3}
+    nx::Int; ny::Int; nz::Int; dx::Float32; dy::Float32; dz::Float32; bc::Symbol; cfl::Float32
+    gs::Float32; store::Symbol; de_prec::Symbol   # GE_SCALE is Float32 (1e7 overflows Float16->Inf)
+end
+
+"""    Grid3DMtlDE16(sys, U0; dx,dy,dz, ge_scale=MTL_GE_SCALE, store=:f16, de_prec=:f16, ...)
+
+f16-storage dual-energy Metal grid for `EulerDE` / `EulerDEColors{NC}`: the conserved buffer lives in
+`MtlArray{Float16}` (HALF the bytes of the f32 `Grid3DMtl`), with the energy slots (5=E, 6=Ge) GE_SCALE-lifted
+into f16's normal range on store and un-lifted on load (mirrors CUDA `ld_de16s_U`/`st_de16s_U`). Advance with
+`mde16_step!`; read back with `read_conserved_de16`. RUN ON AN M5 — not GPU-compilable on the dev host."""
+function Grid3DMtlDE16(sys::Union{EulerDE,EulerDEColors}, U0::Array{NTuple{N,TI},3};
+                       dx, dy, dz, bc::Symbol = :periodic, recon = PLM(), rsol = LLF(),
+                       cfl = 0.3f0, ge_scale::Real = MTL_GE_SCALE,
+                       store::Symbol = :f16, de_prec::Symbol = :f16) where {N,TI}
+    store === :f16 || error("Grid3DMtlDE16 is the f16-storage path (store=:f16).")
+    de_prec === :f16 || error("Grid3DMtlDE16 is the all-f16 dual-energy path (de_prec=:f16).")
+    T = Float16; gs = Float32(ge_scale); nx, ny, nz = size(U0)  # GE_SCALE stays f32 (1e7 > f16 max)
+    Uh = Array{T,4}(undef, nx, ny, nz, N)
+    @inbounds for k in 1:nz, j in 1:ny, i in 1:nx, c in 1:N
+        v = Float32(U0[i,j,k][c]); Uh[i,j,k,c] = T((c == 5 || c == 6) ? v * gs : v)   # lift energies (f32 GE_SCALE)
+    end
+    U = MtlArray(Uh)
+    Grid3DMtlDE16{N,T,typeof(sys),typeof(recon),typeof(rsol)}(
+        sys, recon, rsol, U, similar(U), Metal.zeros(Float32, nx, ny, nz),
+        nx, ny, nz, Float32(dx), Float32(dy), Float32(dz), bc, Float32(cfl), gs, store, de_prec)
+end
+
+# one f16-storage dual-energy sweep along `axis` (fused; compute f32, store f16). Uses the de16 sweep kernels
+# (_mde16_sweepx3/y3/z3) — the SAME contract physics as the f32 split sweeps, advecting Ge via slot 6 and the
+# colours via slots 7..NV, but reading/writing the Float16 buffer (lam is Float32, the compute precision).
+function _mde16_sweep!(g::Grid3DMtlDE16{N,T}, dt, axis::Val{A}, perm) where {N,T,A}
+    thr, grp = _mcfg3(g.nx, g.ny, g.nz)
+    lam = A == 1 ? Float32(dt)/g.dx : A == 2 ? Float32(dt)/g.dy : Float32(dt)/g.dz
+    igs = Float32(inv(g.gs)); gs = Float32(g.gs)
+    kern = A == 1 ? _mde16_sweepx3_kernel! : A == 2 ? _mde16_sweepy3_kernel! : _mde16_sweepz3_kernel!
+    Metal.@metal threads=thr groups=grp kern(g.Unew, g.U, g.sys, g.recon, g.rsol,
+        lam, igs, gs, g.nx, g.ny, g.nz, Val(N), Val(g.bc), perm)
+    g.U, g.Unew = g.Unew, g.U
+    return g
+end
+
+# one full f16-storage dual-energy Strang step. The buffer stays GE_SCALE-LIFTED at ALL times (cold energies
+# would flush to 0 if ever written un-lifted to Float16); each kernel un-lifts only into f32 registers (the
+# CUDA ld_de16s_U/st_de16s_U convention) — so NO standalone scale passes. The split sweeps advect Ge + the
+# colours; the per-cell PdV + Enzo switch then syncs Ge<->E. lam uses dx for the divv central diff (cubic dx).
+function mde16_step!(g::Grid3DMtlDE16{N,T}, dt; rev::Bool = false) where {N,T}
+    px = identperm(Val(N)); py = dirperm(g.sys, N, 2); pz = dirperm(g.sys, N, 3)
+    thr, grp = _mcfg3(g.nx, g.ny, g.nz); igs = Float32(inv(g.gs)); gs = Float32(g.gs)
+    if rev
+        _mde16_sweep!(g, dt, Val(3), pz); _mde16_sweep!(g, dt, Val(2), py); _mde16_sweep!(g, dt, Val(1), px)
+    else
+        _mde16_sweep!(g, dt, Val(1), px); _mde16_sweep!(g, dt, Val(2), py); _mde16_sweep!(g, dt, Val(3), pz)
+    end
+    lam = Float32(dt) / g.dx
+    Metal.@metal threads=thr groups=grp _mde_switch3_kernel!(g.U, g.sys, igs, gs, lam, g.nx, g.ny, g.nz, Val(N), Val(g.bc))
+    return g
+end
+
+function mde16_max_wavespeed(g::Grid3DMtlDE16{N,T}) where {N,T}
+    thr, grp = _mcfg3(g.nx, g.ny, g.nz); igs = Float32(inv(g.gs))
+    Metal.@metal threads=thr groups=grp _mde_speed3_kernel!(g.spd, g.U, g.sys, igs, g.nx, g.ny, g.nz, Val(N),
+        dirperm(g.sys, N, 2), dirperm(g.sys, N, 3))
+    return maximum(g.spd)
+end
+
+function mde16_evolve!(g::Grid3DMtlDE16, tend; maxsteps::Int = 10^7)
+    t = 0f0; tend = Float32(tend); n = 0
+    while t < tend && n < maxsteps
+        c = mde16_max_wavespeed(g); g.sys = FV.prestep(g.sys, c)
+        dt = min(g.cfl * min(g.dx, g.dy, g.dz) / c, tend - t)
+        mde16_step!(g, dt; rev = isodd(n)); t += dt; n += 1
+    end
+    return g
+end
+
+"""    read_conserved_de16(g) -> Array{NTuple{N,Float32},3}
+
+Read the f16-storage dual-energy grid back to host f32 conserved tuples, un-lifting the GE_SCALE-lifted energy
+slots (5=E, 6=Ge). The read-back analog of CUDA `read_conserved_f32` for the f16-storage de16 path."""
+function read_conserved_de16(g::Grid3DMtlDE16{N}) where {N}
+    Uh = Array(g.U); igs = Float32(inv(g.gs))
+    [ntuple(c -> (c == 5 || c == 6) ? Float32(Uh[i,j,k,c]) * igs : Float32(Uh[i,j,k,c]), Val(N))
+     for i in 1:g.nx, j in 1:g.ny, k in 1:g.nz]
+end
+
+mde16_primitives(g::Grid3DMtlDE16{N}) where {N} =
+    (U = read_conserved_de16(g); [cons2prim(g.sys, U[i,j,k]) for i in 1:g.nx, j in 1:g.ny, k in 1:g.nz])
+
+# =============================== M5 validation scripts (run on Apple Silicon) ===============================
+# Mirror the CUDA `EulerDE`/`EulerDEColors` f16-storage tests in test/runtests.jl: build the f16-storage
+# dual-energy grid on the COLD cosmology IC, step it, assert no NaN, rho>0, eint preserved (~6.96e-8, NOT
+# flushed to subnormal 0), colour advects+bounded, and the buffer is HALF the f32 size.
+
+function metal_selfcheck_de16(; nd = (32, 16, 16), nsteps = 20)
+    γd = 5f0/3f0; dxd = Float32(2π/nd[1]); ρ0 = 0.17f0; e0 = 6.96f-8; v0 = 4f-4
+    mkd(i,j,k) = begin
+        x = 2f0π*(i-1)/nd[1]; y = 2f0π*(j-1)/nd[2]; z = 2f0π*(k-1)/nd[3]
+        ρ = ρ0*(1f0+0.03f0*sin(x)); u = v0*(1f0+0.1f0*sin(y)); v = v0*0.1f0*cos(z); w = v0*0.1f0*sin(x+y)
+        eint = e0*(1f0+0.02f0*cos(z)); Ge = ρ*eint; E = Ge + 0.5f0*ρ*(u*u+v*v+w*w)
+        (ρ, ρ*u, ρ*v, ρ*w, E, Ge)
+    end
+    Ud = [mkd(i,j,k) for i in 1:nd[1], j in 1:nd[2], k in 1:nd[3]]
+    sde = EulerDE(γ = γd, η = 1f-3)
+    g = Grid3DMtlDE16(sde, copy(Ud); dx = dxd, dy = dxd, dz = dxd, ge_scale = MTL_GE_SCALE)
+    bytes16 = sizeof(eltype(g.U)) * length(g.U); bytes32 = sizeof(Float32) * length(g.U)
+    c = mde16_max_wavespeed(g); dtd = g.cfl * dxd / c
+    for n in 0:(nsteps-1); mde16_step!(g, dtd; rev = isodd(n)); end
+    Metal.synchronize()
+    W = mde16_primitives(g)
+    fin = all(w -> all(isfinite, w), W); ρmin = minimum(w[1] for w in W)
+    e16 = [w[6] for w in W]; emin, emax = extrema(e16)
+    ok = fin && ρmin > 0 && all(0.5f0*e0 < e < 1.5f0*e0 for e in e16) && emin > 1f-9 && bytes16 == bytes32 ÷ 2
+    println("Metal f16-storage dual-energy (cold gas):")
+    println("  finite=", fin, "  rhomin=", ρmin, "  eint in [", emin, ", ", emax, "]  target e0=", e0)
+    println("  buffer bytes f16=", bytes16, " vs f32=", bytes32, " (HALVED=", bytes16 == bytes32 ÷ 2, ")")
+    println(ok ? "  OK: no NaN, eint preserved, memory halved" : "  (investigate)")
+    return ok
+end
+
+function metal_selfcheck_de16_colors(; nd = (32, 32, 32), nsteps = 20)
+    γd = 5f0/3f0; dxd = Float32(2π/nd[1]); ρ0 = 0.17f0; e0 = 6.96f-8; v0 = 4f-4
+    sph(i,j,k) = ((i-nd[1]/2f0)^2 + (j-nd[2]/2f0)^2 + (k-nd[3]/2f0)^2) < (nd[1]/5f0)^2
+    mkc(i,j,k) = begin
+        x = 2f0π*(i-1)/nd[1]; y = 2f0π*(j-1)/nd[2]; z = 2f0π*(k-1)/nd[3]
+        ρ = ρ0*(1f0+0.03f0*sin(x)); u = v0*(1f0+0.1f0*sin(y)); v = v0*0.1f0*cos(z); w = v0*0.1f0*sin(x+y)
+        eint = e0*(1f0+0.02f0*cos(z)); Ge = ρ*eint; E = Ge + 0.5f0*ρ*(u*u+v*v+w*w)
+        (ρ, ρ*u, ρ*v, ρ*w, E, Ge, ρ*(sph(i,j,k) ? 0.09f0 : 0.05f0))
+    end
+    Uc = [mkc(i,j,k) for i in 1:nd[1], j in 1:nd[2], k in 1:nd[3]]
+    sdc = EulerDEColors{1}(γ = γd, η = 1f-3)
+    X0 = [Uc[i,j,k][7]/Uc[i,j,k][1] for i in 1:nd[1], j in 1:nd[2], k in 1:nd[3]]
+    g = Grid3DMtlDE16(sdc, copy(Uc); dx = dxd, dy = dxd, dz = dxd, ge_scale = MTL_GE_SCALE)
+    c = mde16_max_wavespeed(g); dtd = g.cfl * dxd / c
+    for n in 0:(nsteps-1); mde16_step!(g, dtd; rev = isodd(n)); end
+    Metal.synchronize()
+    W = mde16_primitives(g)
+    fin = all(w -> all(isfinite, w), W); e16 = [w[6] for w in W]; X16 = [w[7] for w in W]
+    advected = maximum(abs.(X16 .- X0)) > 1f-2; bounded = all(0f0 <= x <= 1f0 for x in X16)
+    ok = fin && all(0.5f0*e0 < e < 1.5f0*e0 for e in e16) && advected && bounded
+    println("Metal f16-storage dual-energy + colour:")
+    println("  finite=", fin, "  eint in ", extrema(e16), "  X in ", extrema(X16), "  max|dX|=", maximum(abs.(X16 .- X0)))
+    println(ok ? "  OK: no NaN, eint preserved, colour advects + bounded" : "  (investigate)")
+    return ok
+end
+
 function metal_selfcheck_3d_colors(; n = 16)
     s = FV.Euler(γ = 1.4f0); d = 1f0 / n
     U0 = [FV.prim2cons(s, (1f0 + 0.1f0 * sinpi(2f0 * Float32(i + j + k) / n),
