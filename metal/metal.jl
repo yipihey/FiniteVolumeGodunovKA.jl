@@ -515,17 +515,16 @@ end
 #     tail of k_ctus_de16 (transpile_cuda.jl): PdV on Ge, then the eta switch syncing Ge<->E. --------------
 # `divv_dx` = dx*(div v) from central differences; lam = dt/dx folds the 1/dx (0.5*lam central diff -> dt).
 @inline function _mde_pdv_switch(s, Un::NTuple{NV,Float32}, divv_dx::Float32, lam::Float32) where {NV}
-    rho = Un[1]; mx = Un[2]; my = Un[3]; mz = Un[4]; E = Un[5]; Ge = Un[6]
-    P  = (s.γ - 1f0) * Ge
-    Ge = Ge - lam * P * divv_dx                                   # PdV: -dt*P*(div v)
+    rho = Un[1]; mx = Un[2]; my = Un[3]; mz = Un[4]; E0 = Un[5]; Ge0 = Un[6]
+    P  = (s.γ - 1f0) * Ge0
+    Ge1 = Ge0 - lam * P * divv_dx                                 # PdV: -dt*P*(div v)
     irho = inv(rho); ke = 0.5f0 * irho * (mx*mx + my*my + mz*mz)
-    ratio = E > 0f0 ? (E - ke) / E : -1f0
-    if ratio > s.η
-        Ged = E - ke; Ge = Ged > 0f0 ? Ged : Ge; E = ke + Ge       # warm/shocked: trust E
-    else
-        E = ke + Ge                                                # cold: trust evolved Ge
-    end
-    ntuple(c -> c == 5 ? E : c == 6 ? Ge : Un[c], Val(NV))
+    ratio = ifelse(E0 > 0f0, (E0 - ke) / E0, -1f0)
+    Ged = E0 - ke
+    Gew = ifelse(Ged > 0f0, Ged, Ge1)
+    Ge2 = ifelse(ratio > s.η, Gew, Ge1)
+    E2 = ke + Ge2                                                 # warm trusts E; cold trusts evolved Ge
+    ntuple(c -> c == 5 ? E2 : c == 6 ? Ge2 : Un[c], Val(NV))
 end
 
 # Metal kernel: PdV + Enzo switch over the whole grid (compute f32, store f16, buffer stays lifted). Reads
