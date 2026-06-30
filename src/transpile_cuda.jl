@@ -1128,8 +1128,9 @@ function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::St
     pv = Float32[getfield(sys, p) for p in _fvmeta(sys).params]
     prm = CuArray(pv); prmh = CuArray(Float16.(pv))
     Tbuf = scratch === :minimal ? CUDA.zeros(Tstore, 0) : CUDA.zeros(Tstore, N*VOL)   # third buffer: march-only
+    spd  = scratch === :minimal ? CUDA.zeros(Float32, 0) : CUDA.zeros(Float32, VOL)   # per-cell CFL speed: dt_cfl-only
     Grid3DCuMarch{N,typeof(sys),Tstore}(sys, R, CUDA.zeros(Tstore, N*VOL), Tbuf, prm, prmh,
-                                 CUDA.zeros(Float32, VOL),
+                                 spd,
                                  Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
                                  Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_run_ctus),
                                  Libdl.dlsym(lib, :fv_run_ctum), Libdl.dlsym(lib, :fv_run_ctumh),
@@ -1220,6 +1221,7 @@ end
 
 "Max over cells of the per-cell summed directional signal speed (the unsplit-CFL quantity, on device)."
 function maxspeed_sum(g::Grid3DCuMarch)
+    length(g.spd) > 0 || error("maxspeed_sum/dt_cfl need the spd buffer; build with scratch=:full (not :minimal), or supply the CFL speed externally.")
     if g.store === :f16
         ccall(g.fspeed_de16s, Cvoid, (Ptr{Float16}, Ptr{Float32}, Cint, Cint, Cint, Ptr{Float32}),
               _devptrh(g.R), _devptr(g.spd), g.nx, g.ny, g.nz, _devptr(g.prm))
