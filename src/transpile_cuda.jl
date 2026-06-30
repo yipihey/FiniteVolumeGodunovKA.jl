@@ -175,7 +175,8 @@ extern "C" void fv_hlld(const float* WL,const float* WR,float* F,const float* P)
 """
 
 "`gen_cuda_c(sys) -> String`: the full CUDA-C source emitted from the system's `@fvsystem` stencil."
-function gen_cuda_c(sys::FVSystem; riemann::Symbol = :llf, recon::Symbol = :plm)
+function gen_cuda_c(sys::FVSystem; riemann::Symbol = :llf, recon::Symbol = :plm,
+                    de_prec::Symbol = :mixed, ge_scale::Real = 1)
     m = _fvmeta(sys); NV = m.nvars
     pidx = Dict(p => i-1 for (i,p) in enumerate(m.params)); physset = Set(keys(m.phys))
     want = [:cons2prim, :prim2cons, :physflux_x, :maxspeed_x]
@@ -485,6 +486,235 @@ __global__ void k_ctus_col(const float* R,float* O,int nx,int ny,int nz,float la
     float rho32=R[q]-lam*acc[0], rho16=O[q];
     for(int c=5;c<NV;c++){ float rX=R[(long)c*VOL+q]-lam*acc[c]; O[(long)c*VOL+q]=rho16*(rX/rho32); } } }
 #endif
+#ifdef EULER_DE
+// ===================== MIXED-PRECISION DUAL-ENERGY tiled CTU (EulerDE, NV==6) =====================
+// Storage in the tile (the mixed-precision win): primitive slots 0..3 (rho,u,v,w) in an __half tile
+// `Wh`; the pressure-carrying slots P (=(g-1)Ge) and e (=Ge/rho) in a SEPARATE __float tile `We`.
+// The cold-gas pressure thus NEVER touches f16 (P~5e-8 < the __half subnormal floor ~6e-8 => the
+// all-f16 `k_ctus` NaNs here).  All recon / predictor / Riemann math runs in f32 on the assembled
+// 6-vector, so the flux machinery is the SAME as the f32 `run_ctu!` reference (HLLC/LLF via RSOLVE).
+//
+// Per cell after the conservative update, the DUAL-ENERGY SWITCH (Enzo/Bryan): with KE=0.5*rho*v^2,
+//   (E-KE)/E >  eta  -> trust total energy:  eint=(E-KE)/rho, Ge = rho*eint  (sync Ge to E)
+//   (E-KE)/E <= eta  -> cold: trust evolved Ge,  E = KE + Ge                 (sync E to Ge)
+// and the PdV work  -P (div v)  is added to Ge each step (non-conservative source).
+//
+// Tile layout: Wh has NMOM(=4) __half/cell over the W-halo; We has 2 __float/cell over the W-halo.
+#define NMOM 4
+#define WHI(lx,ly,lz) ((((lz)*WSY+(ly))*WSX+(lx))*NMOM)
+#define WEI(lx,ly,lz) ((((lz)*WSY+(ly))*WSX+(lx))*2)
+// assemble the full f32 primitive 6-vector W=(rho,u,v,w,P,e) for W-halo cell (lx,ly,lz).
+__device__ inline void ld_de(const __half* Wh,const float* We,int lx,int ly,int lz,float* W){
+  const __half* h=Wh+WHI(lx,ly,lz); const float* f=We+WEI(lx,ly,lz);
+  W[0]=__half2float(h[0]); W[1]=__half2float(h[1]); W[2]=__half2float(h[2]); W[3]=__half2float(h[3]);
+  W[4]=f[0]; W[5]=f[1]; }
+// transverse dU (f32) for We/Wh-local cell (lx,ly,lz); reuses the f32 recon+flux_dir machinery.
+__device__ void compute_dU_de(const __half* Wh,const float* We,int lx,int ly,int lz,float lam,const float* PRM,float* dU){
+  float W0[NV],Wxm[NV],Wxp[NV],Wym[NV],Wyp[NV],Wzm[NV],Wzp[NV];
+  ld_de(Wh,We,lx,ly,lz,W0);
+  ld_de(Wh,We,lx-1,ly,lz,Wxm); ld_de(Wh,We,lx+1,ly,lz,Wxp);
+  ld_de(Wh,We,lx,ly-1,lz,Wym); ld_de(Wh,We,lx,ly+1,lz,Wyp);
+  ld_de(Wh,We,lx,ly,lz-1,Wzm); ld_de(Wh,We,lx,ly,lz+1,Wzp);
+  float WxL[NV],WxR[NV],WyL[NV],WyR[NV],WzL[NV],WzR[NV];
+  recon(Wxm,W0,Wxp,WxL,WxR); recon(Wym,W0,Wyp,WyL,WyR); recon(Wzm,W0,Wzp,WzL,WzR);
+  float Fa[NV],Fb[NV],d[NV]; for(int c=0;c<NV;c++) d[c]=0.f;
+  flux_dir(WxR,0,PRM,Fa); flux_dir(WxL,0,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  flux_dir(WyR,1,PRM,Fa); flux_dir(WyL,1,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  flux_dir(WzR,2,PRM,Fa); flux_dir(WzL,2,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  for(int c=0;c<NV;c++) dU[c]=d[c]*-0.5f*lam; }
+// predicted face state (f32) of cell (lx,ly,lz) along dir, evolved by dUcell. side 0=L,1=R.
+__device__ void predicted_face_de(const __half* Wh,const float* We,int lx,int ly,int lz,int dir,int side,const float* dUcell,const float* PRM,float* out){
+  int ex=(dir==0),ey=(dir==1),ez=(dir==2);
+  float Wm[NV],W0[NV],Wp[NV],Wf[NV];
+  ld_de(Wh,We,lx-ex,ly-ey,lz-ez,Wm); ld_de(Wh,We,lx,ly,lz,W0); ld_de(Wh,We,lx+ex,ly+ey,lz+ez,Wp);
+  recon_one(Wm,W0,Wp,side,Wf);
+  float U[NV]; prim2cons(Wf,U,PRM); for(int c=0;c<NV;c++) U[c]+=dUcell[c]; cons2prim(U,out,PRM); }
+// interface flux (f32) between cell (lx,ly,lz) and its +dir neighbor (dUs indexed ds-local).
+__device__ void iface_flux_de(const __half* Wh,const float* We,const float* dUs,int lx,int ly,int lz,int dir,const float* PRM,float* F){
+  int ex=(dir==0),ey=(dir==1),ez=(dir==2); float L[NV],Rr[NV];
+  predicted_face_de(Wh,We,lx,ly,lz,dir,1,dUs+DSI(lx-1,ly-1,lz-1),PRM,L);
+  predicted_face_de(Wh,We,lx+ex,ly+ey,lz+ez,dir,0,dUs+DSI(lx-1+ex,ly-1+ey,lz-1+ez),PRM,Rr);
+  llf_dir(L,Rr,dir,F,PRM); }
+extern __shared__ __half smem_de[];      // [Wh f16 tile | We f32 tile (packed as 2 halves/float)] -- We placed after, float-aligned
+__global__ void k_ctus_de(const float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM){
+  __half* Wh=smem_de;                                   // NMOM f16 / W-halo cell
+  float*  We=(float*)(smem_de + WSX*WSY*WSZ*NMOM);       // 2 f32 / W-halo cell (P,e)
+  float*  dUs=(float*)(We + WSX*WSY*WSZ*2);             // NV f32 / D-halo cell
+  int ox=blockIdx.x*TBX-2, oy=blockIdx.y*TBY-2, oz=blockIdx.z*TBZ-2;
+  int tid=(threadIdx.z*TBY+threadIdx.y)*TBX+threadIdx.x; const int NT=TBX*TBY*TBZ;
+  long VOL=(long)nx*ny*nz;
+  for(int t=tid;t<WSX*WSY*WSZ;t+=NT){                   // phase 0: load + cons2prim into the mixed tile
+    int lx=t%WSX, ly=(t/WSX)%WSY, lz=t/(WSX*WSY);
+    int gx=((ox+lx)%nx+nx)%nx, gy=((oy+ly)%ny+ny)%ny, gz=((oz+lz)%nz+nz)%nz;
+    long q=((long)gz*ny+gy)*nx+gx; float U[NV],W[NV]; for(int c=0;c<NV;c++) U[c]=R[(long)c*VOL+q];
+    cons2prim(U,W,PRM);
+    __half* h=Wh+WHI(lx,ly,lz); h[0]=__float2half(W[0]); h[1]=__float2half(W[1]); h[2]=__float2half(W[2]); h[3]=__float2half(W[3]);
+    float* f=We+WEI(lx,ly,lz); f[0]=W[4]; f[1]=W[5]; }                 // P,e stay f32
+  __syncthreads();
+  for(int t=tid;t<DSX*DSY*DSZ;t+=NT){                   // phase 1: transverse dU once per cell (f32)
+    int dx=t%DSX, dy=(t/DSX)%DSY, dz=t/(DSX*DSY);
+    compute_dU_de(Wh,We,dx+1,dy+1,dz+1,lam,PRM,dUs+DSI(dx,dy,dz)); }
+  __syncthreads();
+  __shared__ float Fs[FSX*FSY*FSZ*NV];
+  int i=blockIdx.x*TBX+threadIdx.x, j=blockIdx.y*TBY+threadIdx.y, k=blockIdx.z*TBZ+threadIdx.z;
+  int tx=threadIdx.x, ty=threadIdx.y, tz=threadIdx.z; bool valid=(i<nx&&j<ny&&k<nz);
+  float acc[NV]; for(int c=0;c<NV;c++) acc[c]=0.f;
+  for(int p=tid;p<FSX*TBY*TBZ;p+=NT){ int fx=p%FSX, fy=(p/FSX)%TBY, fz=p/(FSX*TBY);
+    iface_flux_de(Wh,We,dUs,fx+1,fy+2,fz+2,0,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx+1,ty,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*FSY*TBZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%FSY, fz=p/(TBX*FSY);
+    iface_flux_de(Wh,We,dUs,fx+2,fy+1,fz+2,1,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty+1,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*TBY*FSZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%TBY, fz=p/(TBX*TBY);
+    iface_flux_de(Wh,We,dUs,fx+2,fy+2,fz+1,2,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid){ for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty,tz+1)+c]-Fs[FSI(tx,ty,tz)+c];
+    long q=IDX(i,j,k);
+    // conservative update of all 6 slots (slot 5 = Ge advected by Ge*u).
+    float Un[NV]; for(int c=0;c<NV;c++) Un[c]=R[(long)c*VOL+q]-lam*acc[c];
+    // --- PdV work on Ge:  Ge -= dt * P * (div v).  div v from the central-difference of the tile-local
+    //     velocities (lam = dt/dx already folds the 1/dx; central diff uses 0.5*lam).  P from THIS cell.
+    int wx=tx+2, wy=ty+2, wz=tz+2;   // this cell in the W-halo tile
+    float Wc[NV]; ld_de(Wh,We,wx,wy,wz,Wc);
+    float uxp,uxm,vyp,vym,wzp,wzm,dump[NV];
+    { float Wt[NV]; ld_de(Wh,We,wx+1,wy,wz,Wt); uxp=Wt[1]; ld_de(Wh,We,wx-1,wy,wz,Wt); uxm=Wt[1];
+      ld_de(Wh,We,wx,wy+1,wz,Wt); vyp=Wt[2]; ld_de(Wh,We,wx,wy-1,wz,Wt); vym=Wt[2];
+      ld_de(Wh,We,wx,wy,wz+1,Wt); wzp=Wt[3]; ld_de(Wh,We,wx,wy,wz-1,Wt); wzm=Wt[3]; (void)dump; }
+    float divv = 0.5f*((uxp-uxm)+(vyp-vym)+(wzp-wzm));    // = dx * (div v)
+    Un[5] -= lam * Wc[4] * divv;                          // lam*P*[dx*divv] = dt*P*(div v)
+    // --- DUAL-ENERGY SWITCH (Enzo) -------------------------------------------------------------------
+    float rho=Un[0], irho=1.f/rho;
+    float ke=0.5f*irho*(Un[1]*Un[1]+Un[2]*Un[2]+Un[3]*Un[3]);
+    float E=Un[4], Ge=Un[5], eta=PRM[1];
+    float ratio = (E>0.f)?((E-ke)/E):-1.f;
+    if(ratio > eta){ float Ged = E-ke; Ge = (Ged>0.f)?Ged:Ge; E = ke + Ge; }   // warm/shocked: trust E
+    else           {                    E  = ke + Ge;        }                  // cold: trust evolved Ge
+    Un[4]=E; Un[5]=Ge;
+    for(int c=0;c<NV;c++) O[(long)c*VOL+q]=Un[c]; } }
+extern "C" void fv_run_ctus_de(float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
+  dim3 thr(TBX,TBY,TBZ), grp((nx+TBX-1)/TBX,(ny+TBY-1)/TBY,(nz+TBZ-1)/TBZ);
+  int shbytes=(int)(WSX*WSY*WSZ*NMOM*sizeof(__half) + WSX*WSY*WSZ*2*sizeof(float) + DSX*DSY*DSZ*NV*sizeof(float));
+  cudaFuncSetAttribute(k_ctus_de, cudaFuncAttributeMaxDynamicSharedMemorySize, shbytes);
+  float *a=R,*b=O;
+  for(int s=0;s<nsteps;s++){ k_ctus_de<<<grp,thr,shbytes>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
+  if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
+  cudaDeviceSynchronize(); }
+// ===================== ALL-f16 DUAL-ENERGY tiled CTU (the PRIMARY EXPERIMENT) =====================
+// Identical algorithm to k_ctus_de, but the WHOLE primitive 6-vector W=(rho,u,v,w,P,e) is stored in a
+// single __half tile -- so the cold-gas energies P=(g-1)Ge (~1.1e-7) and e=eint (~1e-6) live in f16 too.
+// The question this kernel answers: does evolving the SECOND energy Ge (no E-KE cancellation) let a cold
+// gas survive ALL-f16, or does f16 lose/zero the (subnormal) cold internal energy?
+//
+// MITIGATION KNOBS (set via -D at compile time; the Julia `de_prec` selects which is built):
+//   GE_SCALE : the pressure-carrying slots P,e are STORED as P*GE_SCALE, e*GE_SCALE and unscaled on read,
+//              so a cold P~1.1e-7 (f16 subnormal, floor ~6e-8) is lifted into f16's NORMAL range.
+//              GE_SCALE==1 is the raw all-f16 test.  (Default 1.)
+//   FTZ is controlled by the nvcc flags (--use_fast_math enables flush-to-zero); the Julia builder can
+//   drop --use_fast_math / pass -ftz=false to test whether FTZ is what zeros the subnormal Ge.
+#ifdef EULER_DE16
+#ifndef GE_SCALE
+#define GE_SCALE 1.f
+#endif
+#define WH6I(lx,ly,lz) ((((lz)*WSY+(ly))*WSX+(lx))*NV)
+// assemble the full f32 primitive 6-vector W from the all-f16 tile (un-scaling the energy slots).
+__device__ inline void ld_de16(const __half* Wh,int lx,int ly,int lz,float* W){
+  const __half* h=Wh+WH6I(lx,ly,lz);
+  W[0]=__half2float(h[0]); W[1]=__half2float(h[1]); W[2]=__half2float(h[2]); W[3]=__half2float(h[3]);
+  W[4]=__half2float(h[4])*(1.f/GE_SCALE); W[5]=__half2float(h[5])*(1.f/GE_SCALE); }
+__device__ void compute_dU_de16(const __half* Wh,int lx,int ly,int lz,float lam,const float* PRM,float* dU){
+  float W0[NV],Wxm[NV],Wxp[NV],Wym[NV],Wyp[NV],Wzm[NV],Wzp[NV];
+  ld_de16(Wh,lx,ly,lz,W0);
+  ld_de16(Wh,lx-1,ly,lz,Wxm); ld_de16(Wh,lx+1,ly,lz,Wxp);
+  ld_de16(Wh,lx,ly-1,lz,Wym); ld_de16(Wh,lx,ly+1,lz,Wyp);
+  ld_de16(Wh,lx,ly,lz-1,Wzm); ld_de16(Wh,lx,ly,lz+1,Wzp);
+  float WxL[NV],WxR[NV],WyL[NV],WyR[NV],WzL[NV],WzR[NV];
+  recon(Wxm,W0,Wxp,WxL,WxR); recon(Wym,W0,Wyp,WyL,WyR); recon(Wzm,W0,Wzp,WzL,WzR);
+  float Fa[NV],Fb[NV],d[NV]; for(int c=0;c<NV;c++) d[c]=0.f;
+  flux_dir(WxR,0,PRM,Fa); flux_dir(WxL,0,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  flux_dir(WyR,1,PRM,Fa); flux_dir(WyL,1,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  flux_dir(WzR,2,PRM,Fa); flux_dir(WzL,2,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  for(int c=0;c<NV;c++) dU[c]=d[c]*-0.5f*lam; }
+__device__ void predicted_face_de16(const __half* Wh,int lx,int ly,int lz,int dir,int side,const float* dUcell,const float* PRM,float* out){
+  int ex=(dir==0),ey=(dir==1),ez=(dir==2);
+  float Wm[NV],W0[NV],Wp[NV],Wf[NV];
+  ld_de16(Wh,lx-ex,ly-ey,lz-ez,Wm); ld_de16(Wh,lx,ly,lz,W0); ld_de16(Wh,lx+ex,ly+ey,lz+ez,Wp);
+  recon_one(Wm,W0,Wp,side,Wf);
+  float U[NV]; prim2cons(Wf,U,PRM); for(int c=0;c<NV;c++) U[c]+=dUcell[c]; cons2prim(U,out,PRM); }
+__device__ void iface_flux_de16(const __half* Wh,const float* dUs,int lx,int ly,int lz,int dir,const float* PRM,float* F){
+  int ex=(dir==0),ey=(dir==1),ez=(dir==2); float L[NV],Rr[NV];
+  predicted_face_de16(Wh,lx,ly,lz,dir,1,dUs+DSI(lx-1,ly-1,lz-1),PRM,L);
+  predicted_face_de16(Wh,lx+ex,ly+ey,lz+ez,dir,0,dUs+DSI(lx-1+ex,ly-1+ey,lz-1+ez),PRM,Rr);
+  llf_dir(L,Rr,dir,F,PRM); }
+extern __shared__ __half smem_de16[];
+__global__ void k_ctus_de16(const float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM){
+  __half* Wh=smem_de16;                                  // NV f16 / W-halo cell (the whole primitive)
+  float*  dUs=(float*)(Wh + WSX*WSY*WSZ*NV);             // NV f32 / D-halo cell
+  int ox=blockIdx.x*TBX-2, oy=blockIdx.y*TBY-2, oz=blockIdx.z*TBZ-2;
+  int tid=(threadIdx.z*TBY+threadIdx.y)*TBX+threadIdx.x; const int NT=TBX*TBY*TBZ;
+  long VOL=(long)nx*ny*nz;
+  for(int t=tid;t<WSX*WSY*WSZ;t+=NT){                    // phase 0: load + cons2prim into the all-f16 tile
+    int lx=t%WSX, ly=(t/WSX)%WSY, lz=t/(WSX*WSY);
+    int gx=((ox+lx)%nx+nx)%nx, gy=((oy+ly)%ny+ny)%ny, gz=((oz+lz)%nz+nz)%nz;
+    long q=((long)gz*ny+gy)*nx+gx; float U[NV],W[NV]; for(int c=0;c<NV;c++) U[c]=R[(long)c*VOL+q];
+    cons2prim(U,W,PRM);
+    __half* h=Wh+WH6I(lx,ly,lz);
+    h[0]=__float2half(W[0]); h[1]=__float2half(W[1]); h[2]=__float2half(W[2]); h[3]=__float2half(W[3]);
+    h[4]=__float2half(W[4]*GE_SCALE); h[5]=__float2half(W[5]*GE_SCALE); }   // P,e scaled into f16 normal range
+  __syncthreads();
+  for(int t=tid;t<DSX*DSY*DSZ;t+=NT){                    // phase 1: transverse dU once per cell (f32)
+    int dx=t%DSX, dy=(t/DSX)%DSY, dz=t/(DSX*DSY);
+    compute_dU_de16(Wh,dx+1,dy+1,dz+1,lam,PRM,dUs+DSI(dx,dy,dz)); }
+  __syncthreads();
+  __shared__ float Fs[FSX*FSY*FSZ*NV];
+  int i=blockIdx.x*TBX+threadIdx.x, j=blockIdx.y*TBY+threadIdx.y, k=blockIdx.z*TBZ+threadIdx.z;
+  int tx=threadIdx.x, ty=threadIdx.y, tz=threadIdx.z; bool valid=(i<nx&&j<ny&&k<nz);
+  float acc[NV]; for(int c=0;c<NV;c++) acc[c]=0.f;
+  for(int p=tid;p<FSX*TBY*TBZ;p+=NT){ int fx=p%FSX, fy=(p/FSX)%TBY, fz=p/(FSX*TBY);
+    iface_flux_de16(Wh,dUs,fx+1,fy+2,fz+2,0,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx+1,ty,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*FSY*TBZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%FSY, fz=p/(TBX*FSY);
+    iface_flux_de16(Wh,dUs,fx+2,fy+1,fz+2,1,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty+1,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*TBY*FSZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%TBY, fz=p/(TBX*TBY);
+    iface_flux_de16(Wh,dUs,fx+2,fy+2,fz+1,2,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid){ for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty,tz+1)+c]-Fs[FSI(tx,ty,tz)+c];
+    long q=IDX(i,j,k);
+    float Un[NV]; for(int c=0;c<NV;c++) Un[c]=R[(long)c*VOL+q]-lam*acc[c];
+    int wx=tx+2, wy=ty+2, wz=tz+2;
+    float Wc[NV]; ld_de16(Wh,wx,wy,wz,Wc);
+    float uxp,uxm,vyp,vym,wzp,wzm;
+    { float Wt[NV]; ld_de16(Wh,wx+1,wy,wz,Wt); uxp=Wt[1]; ld_de16(Wh,wx-1,wy,wz,Wt); uxm=Wt[1];
+      ld_de16(Wh,wx,wy+1,wz,Wt); vyp=Wt[2]; ld_de16(Wh,wx,wy-1,wz,Wt); vym=Wt[2];
+      ld_de16(Wh,wx,wy,wz+1,Wt); wzp=Wt[3]; ld_de16(Wh,wx,wy,wz-1,Wt); wzm=Wt[3]; }
+    float divv = 0.5f*((uxp-uxm)+(vyp-vym)+(wzp-wzm));
+    Un[5] -= lam * Wc[4] * divv;                          // PdV: dt*P*(div v)
+    float rho=Un[0], irho=1.f/rho;
+    float ke=0.5f*irho*(Un[1]*Un[1]+Un[2]*Un[2]+Un[3]*Un[3]);
+    float E=Un[4], Ge=Un[5], eta=PRM[1];
+    float ratio = (E>0.f)?((E-ke)/E):-1.f;
+    if(ratio > eta){ float Ged = E-ke; Ge = (Ged>0.f)?Ged:Ge; E = ke + Ge; }   // warm/shocked: trust E
+    else           {                    E  = ke + Ge;        }                  // cold: trust evolved Ge
+    Un[4]=E; Un[5]=Ge;
+    for(int c=0;c<NV;c++) O[(long)c*VOL+q]=Un[c]; } }
+extern "C" void fv_run_ctus_de16(float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
+  dim3 thr(TBX,TBY,TBZ), grp((nx+TBX-1)/TBX,(ny+TBY-1)/TBY,(nz+TBZ-1)/TBZ);
+  int shbytes=(int)(WSX*WSY*WSZ*NV*sizeof(__half) + DSX*DSY*DSZ*NV*sizeof(float));
+  cudaFuncSetAttribute(k_ctus_de16, cudaFuncAttributeMaxDynamicSharedMemorySize, shbytes);
+  float *a=R,*b=O;
+  for(int s=0;s<nsteps;s++){ k_ctus_de16<<<grp,thr,shbytes>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
+  if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
+  cudaDeviceSynchronize(); }
+#endif
+#endif
 extern "C" void fv_run_ctus(float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
   dim3 thr(TBX,TBY,TBZ), grp((nx+TBX-1)/TBX,(ny+TBY-1)/TBY,(nz+TBZ-1)/TBZ);
   int shbytes=(int)((WSX*WSY*WSZ+DSX*DSY*DSZ)*NV*sizeof(__half));
@@ -688,7 +918,15 @@ extern "C" void fv_run_ctumh(float* R,float* O,int nx,int ny,int nz,float lam,co
     # reconstruction block: emit ppm1/ppm1h + `#define RECON_PPM` to switch recon/recon_one (and the
     # f16 twins) from PLM to local PPM.  Must precede `fixed` (which defines recon).  GLM-MHD keeps PLM.
     cblock = ((!ismhd) && recon === :ppm) ? _PPM1_C : ""
-    "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n#define NV $NV\n\n" *
+    # mixed-precision dual-energy kernel (k_ctus_de) is emitted only for EulerDE (NV==6, slot 6 = Ge).
+    deblock = if sys isa EulerDE
+        b = "#define EULER_DE\n"
+        (de_prec === :f16) && (b *= "#define EULER_DE16\n#define GE_SCALE $(Float32(ge_scale))f\n")
+        b
+    else
+        ""
+    end
+    "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n#define NV $NV\n" * deblock * "\n" *
     join(protos, "\n") * "\n\n" * join(defs, "\n") *
     _genswap("swap_y", m.vidx, 2) * _genswap("swap_z", m.vidx, 3) *
     _genswap("swap_y_h", m.vidx, 2; half = true) * _genswap("swap_z_h", m.vidx, 3; half = true) *
@@ -718,11 +956,16 @@ function _glob(pat)
 end
 
 "`build_cuda(sys; sm) -> so_path`: emit + nvcc-compile the system to a shared library (cached by hash)."
-function build_cuda(sys::FVSystem; sm::String = "sm_86", riemann::Symbol = :llf, recon::Symbol = :plm)
-    src = gen_cuda_c(sys; riemann = riemann, recon = recon); tag = string(hash((typeof(sys), sm, riemann, recon)); base = 16)
+function build_cuda(sys::FVSystem; sm::String = "sm_86", riemann::Symbol = :llf, recon::Symbol = :plm,
+                    de_prec::Symbol = :mixed, ge_scale::Real = 1, fastmath::Bool = true)
+    src = gen_cuda_c(sys; riemann = riemann, recon = recon, de_prec = de_prec, ge_scale = ge_scale)
+    tag = string(hash((typeof(sys), sm, riemann, recon, de_prec, Float32(ge_scale), fastmath)); base = 16)
     dir = mktempdir(; cleanup = false); cu = joinpath(dir, "fv_$tag.cu"); so = joinpath(dir, "libfv_$tag.so")
     write(cu, src)
-    run(`$(_find_nvcc()) -O3 -arch=$sm --use_fast_math --shared -Xcompiler -fPIC -o $so $cu`)
+    # --use_fast_math implies flush-to-zero (FTZ); dropping it (+ -ftz=false) is the no-FTZ mitigation test
+    # for the all-f16 dual-energy path (whether FTZ is what zeros the subnormal cold Ge).
+    fmflags = fastmath ? ["--use_fast_math"] : ["-ftz=false", "-prec-div=true", "-prec-sqrt=true"]
+    run(`$(_find_nvcc()) -O3 -arch=$sm $fmflags --shared -Xcompiler -fPIC -o $so $cu`)
     return so
 end
 
@@ -732,13 +975,14 @@ mutable struct Grid3DCuMarch{N,S<:FVSystem}
     prm::CuVector{Float32}; prmh::CuVector{Float16}                      # params (f32 + f16 twin for :f16)
     spd::CuVector{Float32}                                               # scratch: per-cell CFL speed
     frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fctu::Ptr{Cvoid}; fctus::Ptr{Cvoid}
-    fctum::Ptr{Cvoid}; fctumh::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
+    fctum::Ptr{Cvoid}; fctumh::Ptr{Cvoid}; fctus_de::Ptr{Cvoid}; fctus_de16::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
     nx::Int; ny::Int; nz::Int; dx::Float32
 end
 
-function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::String = "sm_86", riemann::Symbol = :llf, recon::Symbol = :plm) where {N}
+function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::String = "sm_86", riemann::Symbol = :llf, recon::Symbol = :plm,
+                       de_prec::Symbol = :mixed, ge_scale::Real = 1, fastmath::Bool = true) where {N}
     nx, ny, nz = size(U0); VOL = nx*ny*nz
-    lib = Libdl.dlopen(build_cuda(sys; sm = sm, riemann = riemann, recon = recon))
+    lib = Libdl.dlopen(build_cuda(sys; sm = sm, riemann = riemann, recon = recon, de_prec = de_prec, ge_scale = ge_scale, fastmath = fastmath))
     Uh = Vector{Float32}(undef, N*VOL)
     @inbounds for kk in 0:nz-1, jj in 0:ny-1, ii in 0:nx-1
         q = (kk*ny + jj)*nx + ii + 1; u = U0[ii+1, jj+1, kk+1]
@@ -752,6 +996,8 @@ function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::St
                                  Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
                                  Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_run_ctus),
                                  Libdl.dlsym(lib, :fv_run_ctum), Libdl.dlsym(lib, :fv_run_ctumh),
+                                 (sys isa EulerDE ? Libdl.dlsym(lib, :fv_run_ctus_de) : C_NULL),
+                                 ((sys isa EulerDE && de_prec === :f16) ? Libdl.dlsym(lib, :fv_run_ctus_de16) : C_NULL),
                                  Libdl.dlsym(lib, :fv_speed), nx, ny, nz, Float32(dx))
 end
 
@@ -799,6 +1045,29 @@ stay f32). Lower precision by design — fastest at scale for hydro/turbulence. 
 function run_ctumh!(g::Grid3DCuMarch, dt, nsteps::Integer)
     ccall(g.fctumh, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float16}, Cint),
           _devptr(g.R), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptrh(g.prmh), Int32(nsteps))
+    return g
+end
+
+"""Run `nsteps` of the MIXED-PRECISION DUAL-ENERGY tiled CTU (EulerDE only): ρ,ρu,ρv,ρw stored f16 in the
+tile, P and the dual energy e=Ge/ρ kept f32, so a COLD gas (eint ≪ KE) advances WITHOUT the f16 pressure
+NaN.  Pressure = (γ-1)·Ge; the PdV source −P(∇·v) and the Enzo dual-energy switch are applied per cell.
+Result in `g.R`."""
+function run_ctus_de!(g::Grid3DCuMarch, dt, nsteps::Integer)
+    g.fctus_de === C_NULL && error("run_ctus_de! requires an EulerDE grid (the mixed-precision dual-energy kernel is emitted only for EulerDE).")
+    ccall(g.fctus_de, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
+          _devptr(g.R), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
+    return g
+end
+
+"""Run `nsteps` of the ALL-f16 DUAL-ENERGY tiled CTU (EulerDE built with `de_prec=:f16`): the WHOLE
+primitive 6-vector (ρ,u,v,w,P,e) is stored in __half — the PRIMARY cold-gas experiment.  Pressure is
+the dual energy P=(γ-1)Ge so there is no E−½ρv² cancellation; the question is whether f16 can HOLD the
+(subnormal) cold internal energy.  Build with `ge_scale`>1 to lift P,e into f16's normal range and/or
+`fastmath=false` to drop FTZ.  Result in `g.R`."""
+function run_ctus_de16!(g::Grid3DCuMarch, dt, nsteps::Integer)
+    g.fctus_de16 === C_NULL && error("run_ctus_de16! requires an EulerDE grid built with de_prec=:f16.")
+    ccall(g.fctus_de16, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
+          _devptr(g.R), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
     return g
 end
 

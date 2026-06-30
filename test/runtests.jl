@@ -446,6 +446,40 @@ if CUDA.functional()
                 NC >= 2 && @test maximum(abs.(((blk(g16.R,6).+blk(g16.R,7))./ρ) .- 1f0)) < 1f-4  # ΣX preserved
             end
 
+            # DUAL-ENERGY: a COLD gas (eint ≪ KE, E in the f16 subnormal range) that NaNs the single-energy
+            # f16-tiled run_ctus! survives ALL-f16 in EulerDE — pressure comes from the evolved Ge, never the
+            # cancelling E−½ρv².  Premise + headline + eint preservation + (rho,v) match to the f32 DE path.
+            @testset "EulerDE: ALL-f16 dual-energy on cold gas (no NaN, eint preserved)" begin
+                γd=5f0/3f0; nd=(32,16,16); dxd=Float32(2π/nd[1]); ρ0=0.17f0; e0=6.96f-8; v0=4f-4
+                # KE ≫ eint and E ~ 2e-7 (f16 subnormal) — the cancellation regime of the real cosmology state.
+                mkd(i,j,k) = begin
+                    x=2f0π*(i-1)/nd[1]; y=2f0π*(j-1)/nd[2]; z=2f0π*(k-1)/nd[3]
+                    ρ=ρ0*(1f0+0.03f0*sin(x)); u=v0*(1f0+0.1f0*sin(y)); v=v0*0.1f0*cos(z); w=v0*0.1f0*sin(x+y)
+                    eint=e0*(1f0+0.02f0*cos(z)); Ge=ρ*eint; E=Ge+0.5f0*ρ*(u*u+v*v+w*w)
+                    (ρ,ρ*u,ρ*v,ρ*w,E,Ge)
+                end
+                Ud=[mkd(i,j,k) for i in 1:nd[1], j in 1:nd[2], k in 1:nd[3]]
+                # premise: single-energy 5-var Euler all-f16 run_ctus! NaNs this cold state
+                U5=[Ud[i,j,k][1:5] for i in 1:nd[1], j in 1:nd[2], k in 1:nd[3]]
+                gE=Grid3DCuMarch(Euler(γ=γd), U5; dx=dxd); dtd=dt_cfl(gE; cfl=0.3f0)
+                FV.run_ctus!(gE, dtd, 1)
+                @test any(x->!isfinite(x), Array(gE.R))                    # single-energy f16 DOES NaN
+                # headline: all-f16 dual-energy runs cold gas with NO NaN, eint preserved (~6.96e-8), rho>0
+                sde=EulerDE(γ=γd, η=1f-3)
+                g16=Grid3DCuMarch(sde, copy(Ud); dx=dxd, de_prec=:f16)
+                gf=Grid3DCuMarch(sde, copy(Ud); dx=dxd)                    # f32 DE reference (run_ctu!)
+                FV.run_ctus_de16!(g16, dtd, 20); FV.run_ctu!(gf, dtd, 20)
+                W16=FV.primitives(g16); Wf=FV.primitives(gf)
+                @test all(w->all(isfinite,w), W16)                        # no NaN/Inf
+                @test all(w->w[1]>0, W16)                                 # rho>0
+                e16=[w[6] for w in W16]
+                @test all(0.9f0*e0 .< e16 .< 1.1f0*e0)                    # eint preserved ≈6.96e-8, not flushed to 0
+                @test minimum(e16) > 1f-9                                  # explicitly NOT lost to subnormal underflow
+                # (rho,v) match the f32 dual-energy path to f16 tolerance
+                @test maximum(abs(W16[i][1]-Wf[i][1]) for i in eachindex(Wf)) < 5f-3*ρ0
+                @test maximum(abs(W16[i][2]-Wf[i][2]) for i in eachindex(Wf)) < 5f-2*v0 + 1f-5
+            end
+
             s = Euler(γ=1.4f0); n = 32; d = 1f0/n
             U0 = [prim2cons(s, (1f0+0.1f0*sinpi(2f0*Float32(i+j+k)/n), 0.2f0,0.1f0,0.1f0, 1f0)) for i in 1:n, j in 1:n, k in 1:n]
             g = Grid3DCuMarch(s, U0; dx=d); FV.run!(g, 0.2f0*d, 20); W = FV.primitives(g)
