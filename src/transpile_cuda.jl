@@ -413,12 +413,92 @@ __global__ void k_ctus(const float* R,float* O,int nx,int ny,int nz,float lam,co
   __syncthreads();
   if(valid){ for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty,tz+1)+c]-Fs[FSI(tx,ty,tz)+c];
     long q=IDX(i,j,k); for(int c=0;c<NV;c++) O[(long)c*VOL+q]=R[(long)c*VOL+q]-lam*acc[c]; } }
+#if NV>5
+// ---- f32 COLOUR side-channel for the f16-tiled CTU (passive species slots 5..NV-1) ----
+// The f16 tile stores primitives in __half, so a trace species X~1e-25 (< the __half subnormal floor
+// ~6e-8) underflows to 0 and never advects.  k_ctus therefore carries the 5 HYDRO vars correctly but
+// corrupts trace colours.  This twin re-runs the IDENTICAL tiled CTU in *float* (no underflow) and writes
+// back ONLY the colour slots — an exact passive-advection side-channel: same PLM recon + transverse
+// predictor + LLF the hydro used, so SigmaX=1 / uniform-X are preserved, and colours match f32 run_ctu!.
+// (The hydro slots in O stay the fast f16 result; this kernel overwrites slots 5..NV-1 of O only.)
+__device__ void compute_dU_f(const float* Ws,int lx,int ly,int lz,float lam,const float* PRM,float* dU){
+  float W0[NV],Wxm[NV],Wxp[NV],Wym[NV],Wyp[NV],Wzm[NV],Wzp[NV];
+  for(int c=0;c<NV;c++){ W0[c]=Ws[WSI(lx,ly,lz)+c];
+    Wxm[c]=Ws[WSI(lx-1,ly,lz)+c]; Wxp[c]=Ws[WSI(lx+1,ly,lz)+c];
+    Wym[c]=Ws[WSI(lx,ly-1,lz)+c]; Wyp[c]=Ws[WSI(lx,ly+1,lz)+c];
+    Wzm[c]=Ws[WSI(lx,ly,lz-1)+c]; Wzp[c]=Ws[WSI(lx,ly,lz+1)+c]; }
+  float WxL[NV],WxR[NV],WyL[NV],WyR[NV],WzL[NV],WzR[NV];
+  recon(Wxm,W0,Wxp,WxL,WxR); recon(Wym,W0,Wyp,WyL,WyR); recon(Wzm,W0,Wzp,WzL,WzR);
+  float Fa[NV],Fb[NV],d[NV]; for(int c=0;c<NV;c++) d[c]=0.f;
+  flux_dir(WxR,0,PRM,Fa); flux_dir(WxL,0,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  flux_dir(WyR,1,PRM,Fa); flux_dir(WyL,1,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  flux_dir(WzR,2,PRM,Fa); flux_dir(WzL,2,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  for(int c=0;c<NV;c++) dU[c]=d[c]*-0.5f*lam; }
+__device__ void predicted_face_f(const float* Ws,int lx,int ly,int lz,int dir,int side,const float* dUcell,const float* PRM,float* out){
+  int ex=(dir==0),ey=(dir==1),ez=(dir==2);
+  float Wm[NV],W0[NV],Wp[NV],Wf[NV];
+  for(int c=0;c<NV;c++){ Wm[c]=Ws[WSI(lx-ex,ly-ey,lz-ez)+c]; W0[c]=Ws[WSI(lx,ly,lz)+c]; Wp[c]=Ws[WSI(lx+ex,ly+ey,lz+ez)+c]; }
+  recon_one(Wm,W0,Wp,side,Wf);
+  float U[NV]; prim2cons(Wf,U,PRM); for(int c=0;c<NV;c++) U[c]+=dUcell[c]; cons2prim(U,out,PRM); }
+__device__ void iface_flux_f(const float* Ws,const float* dUs,int lx,int ly,int lz,int dir,const float* PRM,float* F){
+  int ex=(dir==0),ey=(dir==1),ez=(dir==2); float L[NV],Rr[NV];
+  predicted_face_f(Ws,lx,ly,lz,dir,1,dUs+DSI(lx-1,ly-1,lz-1),PRM,L);
+  predicted_face_f(Ws,lx+ex,ly+ey,lz+ez,dir,0,dUs+DSI(lx-1+ex,ly-1+ey,lz-1+ez),PRM,Rr);
+  llf_dir(L,Rr,dir,F,PRM); }
+extern __shared__ float fmem[];
+__global__ void k_ctus_col(const float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM){
+  float* Ws=fmem; float* dUs=fmem+WSX*WSY*WSZ*NV;
+  int ox=blockIdx.x*TBX-2, oy=blockIdx.y*TBY-2, oz=blockIdx.z*TBZ-2;
+  int tid=(threadIdx.z*TBY+threadIdx.y)*TBX+threadIdx.x; const int NT=TBX*TBY*TBZ;
+  long VOL=(long)nx*ny*nz;
+  for(int t=tid;t<WSX*WSY*WSZ;t+=NT){
+    int lx=t%WSX, ly=(t/WSX)%WSY, lz=t/(WSX*WSY);
+    int gx=((ox+lx)%nx+nx)%nx, gy=((oy+ly)%ny+ny)%ny, gz=((oz+lz)%nz+nz)%nz;
+    long q=((long)gz*ny+gy)*nx+gx; float U[NV]; for(int c=0;c<NV;c++) U[c]=R[(long)c*VOL+q];
+    cons2prim(U,Ws+WSI(lx,ly,lz),PRM); }
+  __syncthreads();
+  for(int t=tid;t<DSX*DSY*DSZ;t+=NT){
+    int dx=t%DSX, dy=(t/DSX)%DSY, dz=t/(DSX*DSY);
+    compute_dU_f(Ws,dx+1,dy+1,dz+1,lam,PRM,dUs+DSI(dx,dy,dz)); }
+  __syncthreads();
+  __shared__ float Fs[FSX*FSY*FSZ*NV];
+  int i=blockIdx.x*TBX+threadIdx.x, j=blockIdx.y*TBY+threadIdx.y, k=blockIdx.z*TBZ+threadIdx.z;
+  int tx=threadIdx.x, ty=threadIdx.y, tz=threadIdx.z; bool valid=(i<nx&&j<ny&&k<nz);
+  float acc[NV]; for(int c=0;c<NV;c++) acc[c]=0.f;
+  for(int p=tid;p<FSX*TBY*TBZ;p+=NT){ int fx=p%FSX, fy=(p/FSX)%TBY, fz=p/(FSX*TBY);
+    iface_flux_f(Ws,dUs,fx+1,fy+2,fz+2,0,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx+1,ty,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*FSY*TBZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%FSY, fz=p/(TBX*FSY);
+    iface_flux_f(Ws,dUs,fx+2,fy+1,fz+2,1,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty+1,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*TBY*FSZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%TBY, fz=p/(TBX*TBY);
+    iface_flux_f(Ws,dUs,fx+2,fy+2,fz+1,2,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid){ for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty,tz+1)+c]-Fs[FSI(tx,ty,tz)+c];
+    long q=IDX(i,j,k);
+    // exact CMA: form X from the f32-advected (rho*X)/rho, then re-attach to the f16 hydro density O[0]
+    // (written by k_ctus) so uniform-X / SigmaX=1 are preserved against the f16 density update.
+    float rho32=R[q]-lam*acc[0], rho16=O[q];
+    for(int c=5;c<NV;c++){ float rX=R[(long)c*VOL+q]-lam*acc[c]; O[(long)c*VOL+q]=rho16*(rX/rho32); } } }
+#endif
 extern "C" void fv_run_ctus(float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
   dim3 thr(TBX,TBY,TBZ), grp((nx+TBX-1)/TBX,(ny+TBY-1)/TBY,(nz+TBZ-1)/TBZ);
   int shbytes=(int)((WSX*WSY*WSZ+DSX*DSY*DSZ)*NV*sizeof(__half));
   cudaFuncSetAttribute(k_ctus, cudaFuncAttributeMaxDynamicSharedMemorySize, shbytes);
+#if NV>5
+  int shbcol=(int)((WSX*WSY*WSZ+DSX*DSY*DSZ)*NV*sizeof(float));   // f32 colour twin needs 2x the tile
+  cudaFuncSetAttribute(k_ctus_col, cudaFuncAttributeMaxDynamicSharedMemorySize, shbcol);
+#endif
   float *a=R,*b=O;
-  for(int s=0;s<nsteps;s++){ k_ctus<<<grp,thr,shbytes>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
+  for(int s=0;s<nsteps;s++){ k_ctus<<<grp,thr,shbytes>>>(a,b,nx,ny,nz,lam,PRM);
+#if NV>5
+    k_ctus_col<<<grp,thr,shbcol>>>(a,b,nx,ny,nz,lam,PRM);        // overwrite colour slots with exact f32
+#endif
+    float* t=a; a=b; b=t; }
   if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
 // ===== streaming z-march (2.5D): a 2D (x,y) block marches through z, rolling 5 W + 3 dU planes in shared =====
