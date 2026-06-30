@@ -518,6 +518,67 @@ if CUDA.functional()
                 @test maximum(abs(W16[i][2]-Wf[i][2]) for i in eachindex(Wf)) < 5f-2*v0+1f-5  # u match f32
             end
 
+            # f16-STORAGE grid buffer (store=:f16): the conserved state lives in __half GLOBAL memory (not just
+            # the compute tile), halving the largest persistent allocation.  Energies (E,Ge) are GE_SCALE-lifted
+            # into f16's normal range on store and un-lifted on load; ρ, momenta, colours stored raw.  Validates
+            # vs the f32-buffer de16 (same IC, same GE_SCALE): memory halving + zero NaN + eint preserved.
+            @testset "EulerDEColors{1}: f16-STORAGE de16 (halved buffer, cold gas)" begin
+                γd=5f0/3f0; GS=1f7; nd=(64,64,64); dxd=Float32(2π/nd[1]); ρ0=0.17f0; e0=6.96f-8; v0=4f-4
+                sph(i,j,k) = ((i-32f0)^2+(j-32f0)^2+(k-32f0)^2) < 12f0^2
+                mks(i,j,k) = begin
+                    x=2f0π*(i-1)/nd[1]; y=2f0π*(j-1)/nd[2]; z=2f0π*(k-1)/nd[3]
+                    ρ=ρ0*(1f0+0.03f0*sin(x)); u=v0*(1f0+0.1f0*sin(y)); v=v0*0.1f0*cos(z); w=v0*0.1f0*sin(x+y)
+                    eint=e0*(1f0+0.02f0*cos(z)); Ge=ρ*eint; E=Ge+0.5f0*ρ*(u*u+v*v+w*w)
+                    (ρ,ρ*u,ρ*v,ρ*w,E,Ge, ρ*(sph(i,j,k) ? 0.09f0 : 0.05f0))
+                end
+                Us=[mks(i,j,k) for i in 1:nd[1], j in 1:nd[2], k in 1:nd[3]]
+                sds=EulerDEColors{1}(γ=γd, η=1f-3)
+                g32=Grid3DCuMarch(sds, copy(Us); dx=dxd, de_prec=:f16, ge_scale=GS, riemann=:hllc)               # f32 store
+                g16=Grid3DCuMarch(sds, copy(Us); dx=dxd, de_prec=:f16, ge_scale=GS, riemann=:hllc, store=:f16)   # f16 store
+                @test eltype(g16.R) == Float16                                  # 1. storage IS f16
+                @test sizeof(g16.R) == sizeof(g32.R) ÷ 2                        #    and HALF the bytes of f32 store
+                @test g16.store === :f16
+                dtd=dt_cfl(g32; cfl=0.3f0)
+                FV.run_ctus_de16!(g32, dtd, 30); FV.run_ctus_de16!(g16, dtd, 30)
+                W32=FV.primitives(g32; ge_scale=GS); W16=FV.primitives(g16; ge_scale=GS)
+                @test all(w->all(isfinite,w), W16)                             # 2. zero NaN/Inf
+                @test all(w->w[1]>0, W16)                                       #    rho>0
+                e16=[w[6] for w in W16]
+                @test all(0.5f0*e0 .< e16 .< 1.5f0*e0)                          #    eint preserved ≈6.96e-8
+                @test minimum(e16) > 1f-9                                       #    NOT flushed to subnormal 0
+                # f16-store vs f32-store de16: ρ,v,X track to f16 STORAGE tolerance (lossier than f16-compute alone:
+                # the momenta sit near the f16 subnormal floor ρu≈6.8e-5, so KE — hence the energy slots — carries
+                # f16 mantissa noise; eint's relative diff is the largest, but its ABSOLUTE value is preserved).
+                @test maximum(abs(W16[i][1]-W32[i][1]) for i in eachindex(W32)) < 3f-2*ρ0   # ρ to f16-store tol
+                @test maximum(abs(W16[i][2]-W32[i][2]) for i in eachindex(W32)) < 5f-2*v0 + 1f-4
+                X16=[w[7] for w in W16]; X32=[w[7] for w in W32]
+                @test all(0f0 .<= X16 .<= 1f0)                                  #    colour bounded
+                @test maximum(abs.(X16 .- X32)) < 5f-3                          #    colour matches f32 store
+                # momenta stored RAW in f16 are NOT flushed to zero (above the subnormal floor)
+                VOL=prod(nd); ru16=Float32.(Array(g16.R)[VOL+1:2VOL])
+                @test count(==(0f0), ru16) == 0
+            end
+
+            # f16-STORAGE on WARM/SHOCK gas (Sod): energies are normal-valued (GE_SCALE=1), so the f16 store
+            # tracks the f32 store tightly — the f16-store error here is pure f16 quantization of normal values.
+            @testset "EulerDE: f16-STORAGE de16 warm/shock (Sod) matches f32 store" begin
+                γd=5f0/3f0; nd=(64,64,64); dxd=Float32(1f0/nd[1])
+                mkw(i,j,k)=begin
+                    left = i <= nd[1]÷2; ρ=left ? 1f0 : 0.125f0; P=left ? 1f0 : 0.1f0
+                    Ge=P/(γd-1f0); E=Ge; (ρ,0f0,0f0,0f0,E,Ge)
+                end
+                Uw=[mkw(i,j,k) for i in 1:nd[1], j in 1:nd[2], k in 1:nd[3]]; sdw=EulerDE(γ=γd, η=1f-3)
+                g32=Grid3DCuMarch(sdw, copy(Uw); dx=dxd, de_prec=:f16)
+                g16=Grid3DCuMarch(sdw, copy(Uw); dx=dxd, de_prec=:f16, store=:f16)
+                @test eltype(g16.R) == Float16
+                dtd=dt_cfl(g32; cfl=0.3f0)
+                FV.run_ctus_de16!(g32, dtd, 30); FV.run_ctus_de16!(g16, dtd, 30)
+                W32=FV.primitives(g32); W16=FV.primitives(g16)
+                @test all(w->all(isfinite,w), W16)
+                @test maximum(abs(W16[i][1]-W32[i][1]) for i in eachindex(W32)) < 5f-3   # ρ to f16-store tol
+                @test maximum(abs(W16[i][5]-W32[i][5]) for i in eachindex(W32)) < 5f-3   # P to f16-store tol
+            end
+
             s = Euler(γ=1.4f0); n = 32; d = 1f0/n
             U0 = [prim2cons(s, (1f0+0.1f0*sinpi(2f0*Float32(i+j+k)/n), 0.2f0,0.1f0,0.1f0, 1f0)) for i in 1:n, j in 1:n, k in 1:n]
             g = Grid3DCuMarch(s, U0; dx=d); FV.run!(g, 0.2f0*d, 20); W = FV.primitives(g)

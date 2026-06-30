@@ -38,7 +38,7 @@ export Grid1DCU, evolve_cuda!, primitives_cuda
 export Grid2D, evolve2d!, Grid2DCU, Grid2DSoA, evolve_simd2d!
 export Grid3D, evolve3d!, Grid3DCU, Grid3DSoA, evolve_simd3d!
 export Grid2DCT, evolve_ct!, divB_max
-export Grid3DCuMarch, run!, run_rk2!, run_ctu!, run_ctus!, run_ctum!, run_ctumh!, run_ctus_de!, run_ctus_de16!, dt_cfl, maxspeed_sum
+export Grid3DCuMarch, run!, run_rk2!, run_ctu!, run_ctus!, run_ctum!, run_ctumh!, run_ctus_de!, run_ctus_de16!, dt_cfl, maxspeed_sum, read_conserved_f32
 export EulerColors, EulerDEColors
 export gen_cuda_c, build_cuda, transpile_selfcheck
 

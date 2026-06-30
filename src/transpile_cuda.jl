@@ -176,7 +176,7 @@ extern "C" void fv_hlld(const float* WL,const float* WR,float* F,const float* P)
 
 "`gen_cuda_c(sys) -> String`: the full CUDA-C source emitted from the system's `@fvsystem` stencil."
 function gen_cuda_c(sys::FVSystem; riemann::Symbol = :llf, recon::Symbol = :plm,
-                    de_prec::Symbol = :mixed, ge_scale::Real = 1)
+                    de_prec::Symbol = :mixed, ge_scale::Real = 1, store::Symbol = :f32)
     m = _fvmeta(sys); NV = m.nvars
     pidx = Dict(p => i-1 for (i,p) in enumerate(m.params)); physset = Set(keys(m.phys))
     want = [:cons2prim, :prim2cons, :physflux_x, :maxspeed_x]
@@ -728,6 +728,105 @@ extern "C" void fv_run_ctus_de16(float* R,float* O,int nx,int ny,int nz,float la
   for(int s=0;s<nsteps;s++){ k_ctus_de16<<<grp,thr,shbytes>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
   if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
+// ===================== f16-STORAGE DUAL-ENERGY tiled CTU (HALVES the grid buffer) =====================
+// Identical numerics to k_ctus_de16 (the whole primitive computes in f16 in shared), but the GLOBAL grid
+// buffer R/O is __half too -- so the conserved state lives in f16 memory, NOT f32.  This halves the largest
+// persistent allocation (2*NV*4 B/cell -> 2*NV*2 B/cell) -- the 1024^3-on-44GB enabler.
+//
+// GLOBAL STORAGE LAYOUT (conserved U, var-major __half):
+//   slot 0   rho          stored RAW       (rho~0.17, normal-valued in f16)
+//   slots1-3 ru,rv,rw     stored RAW       (|ru|~2.5e-4, above the f16 subnormal floor ~6e-5)
+//   slot 4   E            stored E*GE_SCALE (cold E~2e-7 is f16-subnormal; GE_SCALE lifts it to normal)
+//   slot 5   Ge           stored Ge*GE_SCALE (cold Ge=rho*eint~1.2e-8 << subnormal floor; GE_SCALE essential)
+//   slots6.. rXi          stored RAW       (colour rho*X~0.05*rho, normal-valued)
+// The SAME GE_SCALE the de16 compute uses is reused for storage, so the lift is a pure read/write transform.
+#ifdef EULER_DE16_STORE
+// load conserved U (NV f32) from the __half global buffer at linear index q, un-lifting the energy slots.
+__device__ inline void ld_de16s_U(const __half* R,long q,long VOL,float* U){
+  for(int c=0;c<NV;c++) U[c]=__half2float(R[(long)c*VOL+q]);
+  U[4]*=(1.f/GE_SCALE); U[5]*=(1.f/GE_SCALE); }
+// store conserved U (NV f32) into the __half global buffer at linear index q, lifting the energy slots.
+__device__ inline void st_de16s_U(__half* O,long q,long VOL,const float* U){
+  O[(long)0*VOL+q]=__float2half(U[0]); O[(long)1*VOL+q]=__float2half(U[1]);
+  O[(long)2*VOL+q]=__float2half(U[2]); O[(long)3*VOL+q]=__float2half(U[3]);
+  O[(long)4*VOL+q]=__float2half(U[4]*GE_SCALE); O[(long)5*VOL+q]=__float2half(U[5]*GE_SCALE);
+  for(int c=6;c<NV;c++) O[(long)c*VOL+q]=__float2half(U[c]); }
+extern __shared__ __half smem_de16s[];
+__global__ void k_ctus_de16s(const __half* R,__half* O,int nx,int ny,int nz,float lam,const float* PRM){
+  __half* Wh=smem_de16s;                                 // NV f16 / W-halo cell (the whole primitive)
+  float*  dUs=(float*)(Wh + WSX*WSY*WSZ*NV);             // NV f32 / D-halo cell
+  int ox=blockIdx.x*TBX-2, oy=blockIdx.y*TBY-2, oz=blockIdx.z*TBZ-2;
+  int tid=(threadIdx.z*TBY+threadIdx.y)*TBX+threadIdx.x; const int NT=TBX*TBY*TBZ;
+  long VOL=(long)nx*ny*nz;
+  for(int t=tid;t<WSX*WSY*WSZ;t+=NT){                    // phase 0: load __half U -> cons2prim -> f16 tile
+    int lx=t%WSX, ly=(t/WSX)%WSY, lz=t/(WSX*WSY);
+    int gx=((ox+lx)%nx+nx)%nx, gy=((oy+ly)%ny+ny)%ny, gz=((oz+lz)%nz+nz)%nz;
+    long q=((long)gz*ny+gy)*nx+gx; float U[NV],W[NV]; ld_de16s_U(R,q,VOL,U);
+    cons2prim(U,W,PRM);
+    __half* h=Wh+WH6I(lx,ly,lz);
+    h[0]=__float2half(W[0]); h[1]=__float2half(W[1]); h[2]=__float2half(W[2]); h[3]=__float2half(W[3]);
+    h[4]=__float2half(W[4]*GE_SCALE); h[5]=__float2half(W[5]*GE_SCALE);      // P,e scaled into f16 normal range
+    for(int c=6;c<NV;c++) h[c]=__float2half(W[c]); }                         // colours Xi stored RAW
+  __syncthreads();
+  for(int t=tid;t<DSX*DSY*DSZ;t+=NT){                    // phase 1: transverse dU once per cell (f32)
+    int dx=t%DSX, dy=(t/DSX)%DSY, dz=t/(DSX*DSY);
+    compute_dU_de16(Wh,dx+1,dy+1,dz+1,lam,PRM,dUs+DSI(dx,dy,dz)); }
+  __syncthreads();
+  __shared__ float Fs[FSX*FSY*FSZ*NV];
+  int i=blockIdx.x*TBX+threadIdx.x, j=blockIdx.y*TBY+threadIdx.y, k=blockIdx.z*TBZ+threadIdx.z;
+  int tx=threadIdx.x, ty=threadIdx.y, tz=threadIdx.z; bool valid=(i<nx&&j<ny&&k<nz);
+  float acc[NV]; for(int c=0;c<NV;c++) acc[c]=0.f;
+  for(int p=tid;p<FSX*TBY*TBZ;p+=NT){ int fx=p%FSX, fy=(p/FSX)%TBY, fz=p/(FSX*TBY);
+    iface_flux_de16(Wh,dUs,fx+1,fy+2,fz+2,0,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx+1,ty,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*FSY*TBZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%FSY, fz=p/(TBX*FSY);
+    iface_flux_de16(Wh,dUs,fx+2,fy+1,fz+2,1,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty+1,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*TBY*FSZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%TBY, fz=p/(TBX*TBY);
+    iface_flux_de16(Wh,dUs,fx+2,fy+2,fz+1,2,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid){ for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty,tz+1)+c]-Fs[FSI(tx,ty,tz)+c];
+    long q=IDX(i,j,k);
+    float U0[NV]; ld_de16s_U(R,q,VOL,U0);                 // base conserved state (un-lifted) from __half global
+    float Un[NV]; for(int c=0;c<NV;c++) Un[c]=U0[c]-lam*acc[c];
+    int wx=tx+2, wy=ty+2, wz=tz+2;
+    float Wc[NV]; ld_de16(Wh,wx,wy,wz,Wc);
+    float uxp,uxm,vyp,vym,wzp,wzm;
+    { float Wt[NV]; ld_de16(Wh,wx+1,wy,wz,Wt); uxp=Wt[1]; ld_de16(Wh,wx-1,wy,wz,Wt); uxm=Wt[1];
+      ld_de16(Wh,wx,wy+1,wz,Wt); vyp=Wt[2]; ld_de16(Wh,wx,wy-1,wz,Wt); vym=Wt[2];
+      ld_de16(Wh,wx,wy,wz+1,Wt); wzp=Wt[3]; ld_de16(Wh,wx,wy,wz-1,Wt); wzm=Wt[3]; }
+    float divv = 0.5f*((uxp-uxm)+(vyp-vym)+(wzp-wzm));
+    Un[5] -= lam * Wc[4] * divv;                          // PdV: dt*P*(div v)
+    float rho=Un[0], irho=1.f/rho;
+    float ke=0.5f*irho*(Un[1]*Un[1]+Un[2]*Un[2]+Un[3]*Un[3]);
+    float E=Un[4], Ge=Un[5], eta=PRM[1];
+    float ratio = (E>0.f)?((E-ke)/E):-1.f;
+    if(ratio > eta){ float Ged = E-ke; Ge = (Ged>0.f)?Ged:Ge; E = ke + Ge; }   // warm/shocked: trust E
+    else           {                    E  = ke + Ge;        }                  // cold: trust evolved Ge
+    Un[4]=E; Un[5]=Ge;
+    st_de16s_U(O,q,VOL,Un); } }                           // store conserved U back as __half (energies lifted)
+// per-cell summed directional signal speed, reading the __half conserved buffer (the f16-store CFL quantity).
+__global__ void k_speed_de16s(const __half* R, float* spd, int nx,int ny,int nz, const float* PRM){
+  int i=blockIdx.x*blockDim.x+threadIdx.x, j=blockIdx.y*blockDim.y+threadIdx.y, k=blockIdx.z*blockDim.z+threadIdx.z;
+  if(i>=nx||j>=ny||k>=nz) return; long VOL=(long)nx*ny*nz;
+  long q=IDX(i,j,k); float U[NV],W[NV]; ld_de16s_U(R,q,VOL,U); cons2prim(U,W,PRM);
+  float wy[NV],wz[NV]; for(int c=0;c<NV;c++){ wy[c]=W[c]; wz[c]=W[c]; } swap_y(wy); swap_z(wz);
+  spd[IDX(i,j,k)] = maxspeed_x(W,PRM)+maxspeed_x(wy,PRM)+maxspeed_x(wz,PRM); }
+extern "C" void fv_speed_de16s(__half* R, float* spd, int nx,int ny,int nz, const float* PRM){
+  dim3 thr(8,8,4), grp((nx+7)/8,(ny+7)/8,(nz+3)/4); k_speed_de16s<<<grp,thr>>>(R,spd,nx,ny,nz,PRM); cudaDeviceSynchronize(); }
+extern "C" void fv_run_ctus_de16s(__half* R,__half* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
+  dim3 thr(TBX,TBY,TBZ), grp((nx+TBX-1)/TBX,(ny+TBY-1)/TBY,(nz+TBZ-1)/TBZ);
+  int shbytes=(int)(WSX*WSY*WSZ*NV*sizeof(__half) + DSX*DSY*DSZ*NV*sizeof(float));
+  cudaFuncSetAttribute(k_ctus_de16s, cudaFuncAttributeMaxDynamicSharedMemorySize, shbytes);
+  __half *a=R,*b=O;
+  for(int s=0;s<nsteps;s++){ k_ctus_de16s<<<grp,thr,shbytes>>>(a,b,nx,ny,nz,lam,PRM); __half* t=a; a=b; b=t; }
+  if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(__half),cudaMemcpyDeviceToDevice);
+  cudaDeviceSynchronize(); }
+#endif
 #endif
 #endif
 extern "C" void fv_run_ctus(float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
@@ -939,6 +1038,8 @@ extern "C" void fv_run_ctumh(float* R,float* O,int nx,int ny,int nz,float lam,co
     deblock = if (sys isa EulerDE) || (sys isa EulerDEColors)
         b = "#define EULER_DE\n"
         (de_prec === :f16) && (b *= "#define EULER_DE16\n#define GE_SCALE $(Float32(ge_scale))f\n")
+        # f16-STORAGE grid buffer (R/O are __half): halves the persistent allocation; needs the de16 kernels.
+        (store === :f16) && (de_prec === :f16) && (b *= "#define EULER_DE16_STORE\n")
         b
     else
         ""
@@ -974,9 +1075,9 @@ end
 
 "`build_cuda(sys; sm) -> so_path`: emit + nvcc-compile the system to a shared library (cached by hash)."
 function build_cuda(sys::FVSystem; sm::String = "sm_86", riemann::Symbol = :llf, recon::Symbol = :plm,
-                    de_prec::Symbol = :mixed, ge_scale::Real = 1, fastmath::Bool = true)
-    src = gen_cuda_c(sys; riemann = riemann, recon = recon, de_prec = de_prec, ge_scale = ge_scale)
-    tag = string(hash((typeof(sys), sm, riemann, recon, de_prec, Float32(ge_scale), fastmath)); base = 16)
+                    de_prec::Symbol = :mixed, ge_scale::Real = 1, fastmath::Bool = true, store::Symbol = :f32)
+    src = gen_cuda_c(sys; riemann = riemann, recon = recon, de_prec = de_prec, ge_scale = ge_scale, store = store)
+    tag = string(hash((typeof(sys), sm, riemann, recon, de_prec, Float32(ge_scale), fastmath, store)); base = 16)
     dir = mktempdir(; cleanup = false); cu = joinpath(dir, "fv_$tag.cu"); so = joinpath(dir, "libfv_$tag.so")
     write(cu, src)
     # --use_fast_math implies flush-to-zero (FTZ); dropping it (+ -ftz=false) is the no-FTZ mitigation test
@@ -986,36 +1087,53 @@ function build_cuda(sys::FVSystem; sm::String = "sm_86", riemann::Symbol = :llf,
     return so
 end
 
-mutable struct Grid3DCuMarch{N,S<:FVSystem}
+mutable struct Grid3DCuMarch{N,S<:FVSystem,T2<:Union{Float32,Float16}}
     sys::S
-    R::CuVector{Float32}; O::CuVector{Float32}; T::CuVector{Float32}     # state + 2 scratch (var-major)
+    R::CuVector{T2}; O::CuVector{T2}; T::CuVector{T2}                    # state + 2 scratch (var-major; T2 = grid storage eltype)
     prm::CuVector{Float32}; prmh::CuVector{Float16}                      # params (f32 + f16 twin for :f16)
     spd::CuVector{Float32}                                               # scratch: per-cell CFL speed
     frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fctu::Ptr{Cvoid}; fctus::Ptr{Cvoid}
     fctum::Ptr{Cvoid}; fctumh::Ptr{Cvoid}; fctus_de::Ptr{Cvoid}; fctus_de16::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
+    fctus_de16s::Ptr{Cvoid}; fspeed_de16s::Ptr{Cvoid}; store::Symbol     # f16-STORAGE de16 path (R/O are __half)
     nx::Int; ny::Int; nz::Int; dx::Float32
 end
 
 function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::String = "sm_86", riemann::Symbol = :llf, recon::Symbol = :plm,
-                       de_prec::Symbol = :mixed, ge_scale::Real = 1, fastmath::Bool = true) where {N}
+                       de_prec::Symbol = :mixed, ge_scale::Real = 1, fastmath::Bool = true, store::Symbol = :f32) where {N}
     nx, ny, nz = size(U0); VOL = nx*ny*nz
-    lib = Libdl.dlopen(build_cuda(sys; sm = sm, riemann = riemann, recon = recon, de_prec = de_prec, ge_scale = ge_scale, fastmath = fastmath))
+    # f16-STORAGE grid buffer: only with the de16 dual-energy path (energies GE_SCALE-lifted into f16 normal range).
+    f16store = store === :f16
+    f16store && (de_prec === :f16 && (sys isa EulerDE || sys isa EulerDEColors)) ||
+        (f16store && error("store=:f16 requires de_prec=:f16 on an EulerDE/EulerDEColors system (the f16-storage de16 kernels)."))
+    Tstore = f16store ? Float16 : Float32
+    lib = Libdl.dlopen(build_cuda(sys; sm = sm, riemann = riemann, recon = recon, de_prec = de_prec, ge_scale = ge_scale, fastmath = fastmath, store = store))
     Uh = Vector{Float32}(undef, N*VOL)
     @inbounds for kk in 0:nz-1, jj in 0:ny-1, ii in 0:nx-1
         q = (kk*ny + jj)*nx + ii + 1; u = U0[ii+1, jj+1, kk+1]
         for c in 1:N; Uh[(c-1)*VOL + q] = u[c]; end
     end
-    R = CuArray(Uh)
+    # The boundary write: host f32 IC -> device storage eltype.  For f16-store, the ENERGY slots (4,5, 0-based
+    # 3,4 in 1-based here: var c with c==5||c==6) must be GE_SCALE-lifted so the kernel reads them un-lifted.
+    if f16store
+        gs = Float32(ge_scale)
+        @inbounds for c in 5:6, q in 1:VOL; Uh[(c-1)*VOL + q] *= gs; end   # lift E (slot 4) & Ge (slot 5) on store
+        R = CuArray(Float16.(Uh))
+    else
+        R = CuArray(Uh)
+    end
     pv = Float32[getfield(sys, p) for p in _fvmeta(sys).params]
     prm = CuArray(pv); prmh = CuArray(Float16.(pv))
-    Grid3DCuMarch{N,typeof(sys)}(sys, R, CUDA.zeros(Float32, N*VOL), CUDA.zeros(Float32, N*VOL), prm, prmh,
+    Grid3DCuMarch{N,typeof(sys),Tstore}(sys, R, CUDA.zeros(Tstore, N*VOL), CUDA.zeros(Tstore, N*VOL), prm, prmh,
                                  CUDA.zeros(Float32, VOL),
                                  Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
                                  Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_run_ctus),
                                  Libdl.dlsym(lib, :fv_run_ctum), Libdl.dlsym(lib, :fv_run_ctumh),
                                  ((sys isa EulerDE || sys isa EulerDEColors) ? Libdl.dlsym(lib, :fv_run_ctus_de) : C_NULL),
                                  (((sys isa EulerDE || sys isa EulerDEColors) && de_prec === :f16) ? Libdl.dlsym(lib, :fv_run_ctus_de16) : C_NULL),
-                                 Libdl.dlsym(lib, :fv_speed), nx, ny, nz, Float32(dx))
+                                 Libdl.dlsym(lib, :fv_speed),
+                                 (f16store ? Libdl.dlsym(lib, :fv_run_ctus_de16s) : C_NULL),
+                                 (f16store ? Libdl.dlsym(lib, :fv_speed_de16s) : C_NULL), store,
+                                 nx, ny, nz, Float32(dx))
 end
 
 @inline _devptr(x) = reinterpret(Ptr{Float32}, UInt(UInt64(pointer(x))))
@@ -1082,6 +1200,12 @@ the dual energy P=(γ-1)Ge so there is no E−½ρv² cancellation; the question
 (subnormal) cold internal energy.  Build with `ge_scale`>1 to lift P,e into f16's normal range and/or
 `fastmath=false` to drop FTZ.  Result in `g.R`."""
 function run_ctus_de16!(g::Grid3DCuMarch, dt, nsteps::Integer)
+    if g.store === :f16                                 # f16-STORAGE path: R/O are __half (halved grid buffer)
+        g.fctus_de16s === C_NULL && error("run_ctus_de16! (f16 store) requires a grid built with store=:f16.")
+        ccall(g.fctus_de16s, Cvoid, (Ptr{Float16}, Ptr{Float16}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
+              _devptrh(g.R), _devptrh(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
+        return g
+    end
     g.fctus_de16 === C_NULL && error("run_ctus_de16! requires an EulerDE grid built with de_prec=:f16.")
     ccall(g.fctus_de16, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
           _devptr(g.R), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
@@ -1090,6 +1214,11 @@ end
 
 "Max over cells of the per-cell summed directional signal speed (the unsplit-CFL quantity, on device)."
 function maxspeed_sum(g::Grid3DCuMarch)
+    if g.store === :f16
+        ccall(g.fspeed_de16s, Cvoid, (Ptr{Float16}, Ptr{Float32}, Cint, Cint, Cint, Ptr{Float32}),
+              _devptrh(g.R), _devptr(g.spd), g.nx, g.ny, g.nz, _devptr(g.prm))
+        return Float32(maximum(g.spd))
+    end
     ccall(g.fspeed, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Ptr{Float32}),
           _devptr(g.R), _devptr(g.spd), g.nx, g.ny, g.nz, _devptr(g.prm))
     Float32(maximum(g.spd))
@@ -1123,14 +1252,25 @@ function evolve!(g::Grid3DCuMarch{N}, tend; cfl = 0.4f0, dtevery::Integer = 4, s
     return (g = g, t = t, nsteps = n)
 end
 
-"Conserved totals Σ U · dx³ (var-major), for the conservation check."
-function conserved_total(g::Grid3DCuMarch{N}) where {N}
-    VOL = g.nx*g.ny*g.nz; v = g.dx^3
-    ntuple(c -> Float32(sum(@view g.R[(c-1)*VOL+1 : c*VOL]) * v), Val(N))
+"Read the conserved grid state back to a host `Vector{Float32}` (var-major), un-lifting the GE_SCALE-lifted
+energy slots (4,5; 1-based 5,6) when the grid is f16-storage. `ge_scale` is the value the grid was built with."
+function read_conserved_f32(g::Grid3DCuMarch{N}; ge_scale::Real = 1) where {N}
+    Uh = Float32.(Array(g.R))                    # f16 -> f32 read-out (or identity for f32 store)
+    if g.store === :f16
+        VOL = g.nx*g.ny*g.nz; igs = 1f0/Float32(ge_scale)
+        @inbounds for c in 5:6, q in 1:VOL; Uh[(c-1)*VOL + q] *= igs; end   # un-lift E (slot 4) & Ge (slot 5)
+    end
+    Uh
 end
 
-function primitives(g::Grid3DCuMarch{N}) where {N}
-    Uh = Array(g.R); VOL = g.nx*g.ny*g.nz
+"Conserved totals Σ U · dx³ (var-major), for the conservation check."
+function conserved_total(g::Grid3DCuMarch{N}; ge_scale::Real = 1) where {N}
+    VOL = g.nx*g.ny*g.nz; v = g.dx^3; Uh = read_conserved_f32(g; ge_scale = ge_scale)
+    ntuple(c -> Float32(sum(@view Uh[(c-1)*VOL+1 : c*VOL]) * v), Val(N))
+end
+
+function primitives(g::Grid3DCuMarch{N}; ge_scale::Real = 1) where {N}
+    Uh = read_conserved_f32(g; ge_scale = ge_scale); VOL = g.nx*g.ny*g.nz
     [cons2prim(g.sys, ntuple(c -> Uh[(c-1)*VOL + ((kk-1)*g.ny + (jj-1))*g.nx + ii], Val(N)))
      for ii in 1:g.nx, jj in 1:g.ny, kk in 1:g.nz]
 end
