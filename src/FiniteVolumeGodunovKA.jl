@@ -39,7 +39,7 @@ export Grid2D, evolve2d!, Grid2DCU, Grid2DSoA, evolve_simd2d!
 export Grid3D, evolve3d!, Grid3DCU, Grid3DSoA, evolve_simd3d!
 export Grid2DCT, evolve_ct!, divB_max
 export Grid3DCuMarch, run!, run_rk2!, run_ctu!, run_ctus!, run_ctum!, run_ctumh!, run_ctus_de!, run_ctus_de16!, dt_cfl, maxspeed_sum
-export EulerColors
+export EulerColors, EulerDEColors
 export gen_cuda_c, build_cuda, transpile_selfcheck
 
 # ---------------------------------------------------------------------------
@@ -103,6 +103,7 @@ include("backend_cuda_3d.jl")
 include("systems.jl")
 include("euler_colors.jl")
 include("euler_de.jl")
+include("euler_de_colors.jl")
 include("riemann_mhd.jl")
 include("backend_ct_2d.jl")
 include("transpile_cuda.jl")

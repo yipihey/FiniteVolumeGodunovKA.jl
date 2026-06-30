@@ -480,6 +480,44 @@ if CUDA.functional()
                 @test maximum(abs(W16[i][2]-Wf[i][2]) for i in eachindex(Wf)) < 5f-2*v0 + 1f-5
             end
 
+            # DUAL-ENERGY + PASSIVE COLOURS (EulerDEColors): the all-f16 de16 path carries the colour
+            # slots in the SAME f16 tile (normal-valued X≈0.05, no underflow) and advects them on the mass
+            # flux — so a COLD gas (eint ≪ KE) runs all-f16 with NO NaN AND a tracer that advects, stays
+            # bounded, and conserves ΣρX.  Mirrors the EulerDE cold-gas test with a colour added.
+            @testset "EulerDEColors{1}: all-f16 dual-energy + advected colour (cold gas)" begin
+                @test transpile_selfcheck(EulerDEColors{1}(γ=5f0/3f0, η=1f-3)) == 0f0   # C ≡ Julia, bit-exact
+                γd=5f0/3f0; nd=(64,64,64); dxd=Float32(2π/nd[1]); ρ0=0.17f0; e0=1f-6; v0=1.5f-3
+                sph(i,j,k) = ((i-32f0)^2+(j-32f0)^2+(k-32f0)^2) < 12f0^2   # sharp colour sphere
+                mkc(i,j,k) = begin
+                    x=2f0π*(i-1)/nd[1]; y=2f0π*(j-1)/nd[2]; z=2f0π*(k-1)/nd[3]
+                    ρ=ρ0*(1f0+0.03f0*sin(x)); u=v0*(1f0+0.1f0*sin(y)); v=v0*0.1f0*cos(z); w=v0*0.1f0*sin(x+y)
+                    eint=e0*(1f0+0.02f0*cos(z)); Ge=ρ*eint; E=Ge+0.5f0*ρ*(u*u+v*v+w*w)
+                    (ρ,ρ*u,ρ*v,ρ*w,E,Ge, ρ*(sph(i,j,k) ? 0.09f0 : 0.05f0))
+                end
+                Uc=[mkc(i,j,k) for i in 1:nd[1], j in 1:nd[2], k in 1:nd[3]]
+                sdc=EulerDEColors{1}(γ=γd, η=1f-3)
+                g16=Grid3DCuMarch(sdc, copy(Uc); dx=dxd, de_prec=:f16, riemann=:hllc)
+                gf =Grid3DCuMarch(sdc, copy(Uc); dx=dxd, riemann=:hllc)   # f32 DE+colour reference (run_ctu!)
+                dtd=dt_cfl(g16; cfl=0.3f0)
+                X0=[Uc[i,j,k][7]/Uc[i,j,k][1] for i in 1:nd[1], j in 1:nd[2], k in 1:nd[3]]
+                mass0=sum(Float64(Uc[i,j,k][7]) for i in 1:nd[1],j in 1:nd[2],k in 1:nd[3])
+                FV.run_ctus_de16!(g16, dtd, 30); FV.run_ctu!(gf, dtd, 30)
+                W16=FV.primitives(g16); Wf=FV.primitives(gf)
+                @test all(w->all(isfinite,w), W16)                       # no NaN/Inf
+                @test all(w->w[1]>0, W16)                                # rho>0
+                e16=[w[6] for w in W16]
+                @test all(0.9f0*e0 .< e16 .< 1.1f0*e0)                   # eint=Ge/ρ preserved ≈1e-6
+                @test minimum(e16) > 1f-9                                # not flushed to subnormal 0
+                X16=[w[7] for w in W16]; Xf=[w[7] for w in Wf]
+                @test all(0f0 .<= X16 .<= 1f0)                           # CMA boundedness 0≤X≤1
+                @test maximum(abs.(X16 .- Xf)) < 5f-3                    # colour matches f32 to f16 tol
+                @test maximum(abs.(X16 .- X0)) > 1f-2                    # colour ADVECTED (didn't freeze)
+                VOL=prod(nd); blk(R,c)=reshape(Array(R)[(c-1)*VOL+1:c*VOL], nd...)
+                @test isapprox(sum(Float64.(blk(g16.R,7))), mass0; rtol=1f-6)   # ΣρX conserved to round-off
+                @test maximum(abs(W16[i][1]-Wf[i][1]) for i in eachindex(Wf)) < 5f-3*ρ0   # ρ match f32
+                @test maximum(abs(W16[i][2]-Wf[i][2]) for i in eachindex(Wf)) < 5f-2*v0+1f-5  # u match f32
+            end
+
             s = Euler(γ=1.4f0); n = 32; d = 1f0/n
             U0 = [prim2cons(s, (1f0+0.1f0*sinpi(2f0*Float32(i+j+k)/n), 0.2f0,0.1f0,0.1f0, 1f0)) for i in 1:n, j in 1:n, k in 1:n]
             g = Grid3DCuMarch(s, U0; dx=d); FV.run!(g, 0.2f0*d, 20); W = FV.primitives(g)

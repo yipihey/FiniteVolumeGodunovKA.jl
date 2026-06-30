@@ -499,15 +499,19 @@ __global__ void k_ctus_col(const float* R,float* O,int nx,int ny,int nz,float la
 //   (E-KE)/E <= eta  -> cold: trust evolved Ge,  E = KE + Ge                 (sync E to Ge)
 // and the PdV work  -P (div v)  is added to Ge each step (non-conservative source).
 //
-// Tile layout: Wh has NMOM(=4) __half/cell over the W-halo; We has 2 __float/cell over the W-halo.
-#define NMOM 4
+// Tile layout: Wh has NMOM(=4+NCOL) __half/cell over the W-halo (rho,u,v,w + the NCOL colours Xᵢ, all
+// normal-valued in f16); We has 2 __float/cell (the cold-pressure-carrying P,e, kept f32).  NCOL=NV-6.
+#define NMOM_DE (4+(NV-6))
+#define NMOM NMOM_DE
 #define WHI(lx,ly,lz) ((((lz)*WSY+(ly))*WSX+(lx))*NMOM)
 #define WEI(lx,ly,lz) ((((lz)*WSY+(ly))*WSX+(lx))*2)
-// assemble the full f32 primitive 6-vector W=(rho,u,v,w,P,e) for W-halo cell (lx,ly,lz).
+// assemble the full f32 primitive (NV)-vector W=(rho,u,v,w,P,e[,X…]) for W-halo cell (lx,ly,lz): the
+// hydro/colour slots come from the f16 tile, the energy slots P,e from the f32 tile.
 __device__ inline void ld_de(const __half* Wh,const float* We,int lx,int ly,int lz,float* W){
   const __half* h=Wh+WHI(lx,ly,lz); const float* f=We+WEI(lx,ly,lz);
   W[0]=__half2float(h[0]); W[1]=__half2float(h[1]); W[2]=__half2float(h[2]); W[3]=__half2float(h[3]);
-  W[4]=f[0]; W[5]=f[1]; }
+  W[4]=f[0]; W[5]=f[1];
+  for(int c=6;c<NV;c++) W[c]=__half2float(h[4+(c-6)]); }   // colours: f16 tile slots 4..4+NCOL-1
 // transverse dU (f32) for We/Wh-local cell (lx,ly,lz); reuses the f32 recon+flux_dir machinery.
 __device__ void compute_dU_de(const __half* Wh,const float* We,int lx,int ly,int lz,float lam,const float* PRM,float* dU){
   float W0[NV],Wxm[NV],Wxp[NV],Wym[NV],Wyp[NV],Wzm[NV],Wzp[NV];
@@ -549,6 +553,7 @@ __global__ void k_ctus_de(const float* R,float* O,int nx,int ny,int nz,float lam
     long q=((long)gz*ny+gy)*nx+gx; float U[NV],W[NV]; for(int c=0;c<NV;c++) U[c]=R[(long)c*VOL+q];
     cons2prim(U,W,PRM);
     __half* h=Wh+WHI(lx,ly,lz); h[0]=__float2half(W[0]); h[1]=__float2half(W[1]); h[2]=__float2half(W[2]); h[3]=__float2half(W[3]);
+    for(int c=6;c<NV;c++) h[4+(c-6)]=__float2half(W[c]);              // colours Xi into the f16 tile
     float* f=We+WEI(lx,ly,lz); f[0]=W[4]; f[1]=W[5]; }                 // P,e stay f32
   __syncthreads();
   for(int t=tid;t<DSX*DSY*DSZ;t+=NT){                   // phase 1: transverse dU once per cell (f32)
@@ -619,12 +624,18 @@ extern "C" void fv_run_ctus_de(float* R,float* O,int nx,int ny,int nz,float lam,
 #ifndef GE_SCALE
 #define GE_SCALE 1.f
 #endif
+// NCOL = number of passive colour slots (EulerDEColors{NC} -> NV-6; plain EulerDE -> 0).  Colours occupy
+// the f16 tile slots 6..NV-1 and are stored RAW (no GE_SCALE): they are normal-valued in f16 (X~0.05) and
+// must NOT be lifted — only the cold-gas energy slots P,e (4,5) need GE_SCALE.
+#define NCOL (NV-6)
 #define WH6I(lx,ly,lz) ((((lz)*WSY+(ly))*WSX+(lx))*NV)
-// assemble the full f32 primitive 6-vector W from the all-f16 tile (un-scaling the energy slots).
+// assemble the full f32 primitive (NV)-vector W from the all-f16 tile (un-scaling ONLY the energy slots;
+// the colour slots 6..NV-1 are passed through unscaled).
 __device__ inline void ld_de16(const __half* Wh,int lx,int ly,int lz,float* W){
   const __half* h=Wh+WH6I(lx,ly,lz);
   W[0]=__half2float(h[0]); W[1]=__half2float(h[1]); W[2]=__half2float(h[2]); W[3]=__half2float(h[3]);
-  W[4]=__half2float(h[4])*(1.f/GE_SCALE); W[5]=__half2float(h[5])*(1.f/GE_SCALE); }
+  W[4]=__half2float(h[4])*(1.f/GE_SCALE); W[5]=__half2float(h[5])*(1.f/GE_SCALE);
+  for(int c=6;c<NV;c++) W[c]=__half2float(h[c]); }
 __device__ void compute_dU_de16(const __half* Wh,int lx,int ly,int lz,float lam,const float* PRM,float* dU){
   float W0[NV],Wxm[NV],Wxp[NV],Wym[NV],Wyp[NV],Wzm[NV],Wzp[NV];
   ld_de16(Wh,lx,ly,lz,W0);
@@ -663,7 +674,8 @@ __global__ void k_ctus_de16(const float* R,float* O,int nx,int ny,int nz,float l
     cons2prim(U,W,PRM);
     __half* h=Wh+WH6I(lx,ly,lz);
     h[0]=__float2half(W[0]); h[1]=__float2half(W[1]); h[2]=__float2half(W[2]); h[3]=__float2half(W[3]);
-    h[4]=__float2half(W[4]*GE_SCALE); h[5]=__float2half(W[5]*GE_SCALE); }   // P,e scaled into f16 normal range
+    h[4]=__float2half(W[4]*GE_SCALE); h[5]=__float2half(W[5]*GE_SCALE);      // P,e scaled into f16 normal range
+    for(int c=6;c<NV;c++) h[c]=__float2half(W[c]); }                         // colours Xi stored RAW (normal-valued)
   __syncthreads();
   for(int t=tid;t<DSX*DSY*DSZ;t+=NT){                    // phase 1: transverse dU once per cell (f32)
     int dx=t%DSX, dy=(t/DSX)%DSY, dz=t/(DSX*DSY);
@@ -688,6 +700,9 @@ __global__ void k_ctus_de16(const float* R,float* O,int nx,int ny,int nz,float l
   __syncthreads();
   if(valid){ for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty,tz+1)+c]-Fs[FSI(tx,ty,tz)+c];
     long q=IDX(i,j,k);
+    // conservative update of ALL slots: 0..3 hydro, 4 E, 5 Ge, 6..NV-1 colours ρXᵢ.  Density (slot 0) and
+    // each ρXᵢ ride the IDENTICAL tile-local f16 mass flux, so Xᵢ = (ρXᵢ)/ρ stays bounded and uniform-X /
+    // ΣX are preserved against the f16 density update (exact CMA, no separate colour pass needed here).
     float Un[NV]; for(int c=0;c<NV;c++) Un[c]=R[(long)c*VOL+q]-lam*acc[c];
     int wx=tx+2, wy=ty+2, wz=tz+2;
     float Wc[NV]; ld_de16(Wh,wx,wy,wz,Wc);
@@ -918,8 +933,10 @@ extern "C" void fv_run_ctumh(float* R,float* O,int nx,int ny,int nz,float lam,co
     # reconstruction block: emit ppm1/ppm1h + `#define RECON_PPM` to switch recon/recon_one (and the
     # f16 twins) from PLM to local PPM.  Must precede `fixed` (which defines recon).  GLM-MHD keeps PLM.
     cblock = ((!ismhd) && recon === :ppm) ? _PPM1_C : ""
-    # mixed-precision dual-energy kernel (k_ctus_de) is emitted only for EulerDE (NV==6, slot 6 = Ge).
-    deblock = if sys isa EulerDE
+    # dual-energy kernels (k_ctus_de / all-f16 k_ctus_de16) are emitted for EulerDE (NV==6, slot 6 = Ge)
+    # AND EulerDEColors{NC} (NV==6+NC; slots 6..5+NC = colours).  The kernels are NV-generic: the colour
+    # slots ride the f16 tile (NCOL=NV-6, stored raw) and advect with the hydro mass flux.
+    deblock = if (sys isa EulerDE) || (sys isa EulerDEColors)
         b = "#define EULER_DE\n"
         (de_prec === :f16) && (b *= "#define EULER_DE16\n#define GE_SCALE $(Float32(ge_scale))f\n")
         b
@@ -996,8 +1013,8 @@ function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::St
                                  Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
                                  Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_run_ctus),
                                  Libdl.dlsym(lib, :fv_run_ctum), Libdl.dlsym(lib, :fv_run_ctumh),
-                                 (sys isa EulerDE ? Libdl.dlsym(lib, :fv_run_ctus_de) : C_NULL),
-                                 ((sys isa EulerDE && de_prec === :f16) ? Libdl.dlsym(lib, :fv_run_ctus_de16) : C_NULL),
+                                 ((sys isa EulerDE || sys isa EulerDEColors) ? Libdl.dlsym(lib, :fv_run_ctus_de) : C_NULL),
+                                 (((sys isa EulerDE || sys isa EulerDEColors) && de_prec === :f16) ? Libdl.dlsym(lib, :fv_run_ctus_de16) : C_NULL),
                                  Libdl.dlsym(lib, :fv_speed), nx, ny, nz, Float32(dx))
 end
 
