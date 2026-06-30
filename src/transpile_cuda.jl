@@ -1099,7 +1099,11 @@ mutable struct Grid3DCuMarch{N,S<:FVSystem,T2<:Union{Float32,Float16}}
 end
 
 function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::String = "sm_86", riemann::Symbol = :llf, recon::Symbol = :plm,
-                       de_prec::Symbol = :mixed, ge_scale::Real = 1, fastmath::Bool = true, store::Symbol = :f32) where {N}
+                       de_prec::Symbol = :mixed, ge_scale::Real = 1, fastmath::Bool = true, store::Symbol = :f32,
+                       scratch::Symbol = :full) where {N}
+    # scratch=:minimal drops the third state buffer `T` (NV·VOL) — it is used ONLY by the cube-tiled
+    # march paths run_ctum!/run_ctumh!.  The single-pass/CTU/RK2/de/de16/de16s paths use only R+O, so a
+    # caller that never marches (e.g. the Vespa PatchGrid adapter) saves a full state buffer with :minimal.
     nx, ny, nz = size(U0); VOL = nx*ny*nz
     # f16-STORAGE grid buffer: only with the de16 dual-energy path (energies GE_SCALE-lifted into f16 normal range).
     f16store = store === :f16
@@ -1123,7 +1127,8 @@ function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::St
     end
     pv = Float32[getfield(sys, p) for p in _fvmeta(sys).params]
     prm = CuArray(pv); prmh = CuArray(Float16.(pv))
-    Grid3DCuMarch{N,typeof(sys),Tstore}(sys, R, CUDA.zeros(Tstore, N*VOL), CUDA.zeros(Tstore, N*VOL), prm, prmh,
+    Tbuf = scratch === :minimal ? CUDA.zeros(Tstore, 0) : CUDA.zeros(Tstore, N*VOL)   # third buffer: march-only
+    Grid3DCuMarch{N,typeof(sys),Tstore}(sys, R, CUDA.zeros(Tstore, N*VOL), Tbuf, prm, prmh,
                                  CUDA.zeros(Float32, VOL),
                                  Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
                                  Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_run_ctus),
@@ -1149,6 +1154,7 @@ end
 
 "Run `nsteps` of the genuinely 2nd-order MUSCL + SSP-RK2 scheme at fixed `dt` (result left in `g.R`)."
 function run_rk2!(g::Grid3DCuMarch, dt, nsteps::Integer)
+    length(g.T) > 0 || error("run_rk2! needs the third state buffer; build with scratch=:full (not :minimal).")
     ccall(g.frun2, Cvoid, (Ptr{Float32}, Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
           _devptr(g.R), _devptr(g.T), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
     return g
