@@ -615,6 +615,35 @@ function Grid3DMtlDE16(sys::Union{EulerDE,EulerDEColors}, U0::Array{NTuple{N,TI}
         nx, ny, nz, Float32(dx), Float32(dy), Float32(dz), bc, Float32(cfl), gs, store, de_prec)
 end
 
+"""    Grid3DMtlDE16(sys, dims::NTuple{3,Int}; dx,dy,dz, ...)
+
+Allocate an empty f16-storage Metal dual-energy grid without materializing a host
+`Array{NTuple}` initializer or a host Float16 staging cube. Callers that immediately
+fill `g.U` on device, such as CICASS' patch/FVGK gather path, avoid a large startup
+peak while preserving the same persistent `U`, `Unew`, and `spd` layout.
+"""
+function Grid3DMtlDE16(sys::Union{EulerDE,EulerDEColors}, dims::NTuple{3,Int};
+                       dx, dy, dz, bc::Symbol = :periodic, recon = PLM(), rsol = LLF(),
+                       cfl = 0.3f0, ge_scale::Real = MTL_GE_SCALE,
+                       store::Symbol = :f16, de_prec::Symbol = :f16)
+    return _Grid3DMtlDE16_empty(sys, Val(FV.nconserved(sys)), dims;
+        dx=dx, dy=dy, dz=dz, bc=bc, recon=recon, rsol=rsol,
+        cfl=cfl, ge_scale=ge_scale, store=store, de_prec=de_prec)
+end
+
+function _Grid3DMtlDE16_empty(sys::Union{EulerDE,EulerDEColors}, ::Val{N}, dims::NTuple{3,Int};
+                              dx, dy, dz, bc::Symbol = :periodic, recon = PLM(), rsol = LLF(),
+                              cfl = 0.3f0, ge_scale::Real = MTL_GE_SCALE,
+                              store::Symbol = :f16, de_prec::Symbol = :f16) where {N}
+    store === :f16 || error("Grid3DMtlDE16 is the f16-storage path (store=:f16).")
+    de_prec === :f16 || error("Grid3DMtlDE16 is the all-f16 dual-energy path (de_prec=:f16).")
+    T = Float16; gs = Float32(ge_scale); nx, ny, nz = dims
+    U = Metal.zeros(T, nx, ny, nz, N)
+    Grid3DMtlDE16{N,T,typeof(sys),typeof(recon),typeof(rsol)}(
+        sys, recon, rsol, U, similar(U), Metal.zeros(Float32, nx, ny, nz),
+        nx, ny, nz, Float32(dx), Float32(dy), Float32(dz), bc, Float32(cfl), gs, store, de_prec)
+end
+
 # one f16-storage dual-energy sweep along `axis` (fused; compute f32, store f16). Uses the de16 sweep kernels
 # (_mde16_sweepx3/y3/z3) — the SAME contract physics as the f32 split sweeps, advecting Ge via slot 6 and the
 # colours via slots 7..NV, but reading/writing the Float16 buffer (lam is Float32, the compute precision).
