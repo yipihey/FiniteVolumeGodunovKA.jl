@@ -45,6 +45,10 @@ end
     ρ = W[1]; u = W[2]; P = W[5]
     abs(u) + sqrt(s.γ * P / ρ)
 end
+@inline function eig_x(s::EulerColors{NC}, W) where {NC}
+    ρ = W[1]; u = W[2]; P = W[5]
+    return u, sqrt(s.γ * P / ρ)
+end
 
 # The transpiler consumes `_fvmeta(sys).phys` = (argname, body_Expr) pairs and emits straight-line C
 # (no loops), so the color components must be UNROLLED for each NC. Built here to mirror the Julia

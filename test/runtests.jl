@@ -65,6 +65,24 @@ end
     @test maximum(abs.(log2.(X3[:, :, :, 2]) .- log2(X3[1, 1, 1, 2]))) <= 3f-3
 end
 
+@testset "EulerColors generic backends" begin
+    s = EulerColors{2}(γ = 5f0 / 3f0)
+    @test nconserved(s) == 7
+    W = (1.2f0, 0.3f0, -0.2f0, 0.1f0, 0.9f0, 0.42f0, 0.58f0)
+    @test all(isapprox.(cons2prim(s, prim2cons(s, W)), W; rtol = 1f-5))
+
+    n = 12
+    d = 1f0 / n
+    U0 = [prim2cons(s, (1f0 + 0.1f0 * sinpi(2f0 * Float32(i + j + k) / n),
+                         0.3f0, 0.2f0, 0.1f0, 1f0, 0.42f0, 0.58f0))
+          for i in 1:n, j in 1:n, k in 1:n]
+    g = Grid3D(s, U0; dx = d, dy = d, dz = d, bc = :periodic) # default HLLC must carry colors.
+    FV.step!(g, 0.03f0 * d)
+    X = primitives(g)
+    @test maximum(abs(X[i, j, k][6] - 0.42f0) for i in 1:n, j in 1:n, k in 1:n) <= 1f-5
+    @test maximum(abs(X[i, j, k][6] + X[i, j, k][7] - 1f0) for i in 1:n, j in 1:n, k in 1:n) <= 1f-5
+end
+
 # ---------------------------------------------------------------------------
 # Sod shock tube (Float32, HLLC) — exercises cons2prim/prim2cons/physflux/HLLC,
 # the limiter, and the conservative update against the known star state.

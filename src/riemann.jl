@@ -4,8 +4,8 @@
 #
 #   LLF  — Rusanov. Needs only `maxspeed_x`; works for ANY system.
 #   HLL  — two-wave. Needs `eig_x` (u, c); works for any system that provides it.
-#   HLLC — Euler contact-restoring. Built-in, assumes the Euler primitive layout
-#          (ρ, u, v, w, P) / conserved (ρ, ρu, ρv, ρw, E).
+#   HLLC — Euler contact-restoring. Built-in, assumes the first five primitive slots are
+#          (ρ, u, v, w, P) and carries any extra slots as passive scalar fractions.
 
 struct LLF  end
 struct HLL  end
@@ -46,10 +46,10 @@ end
 
     qL = mL / (SL - Sstar)                                  # ρ(S-u)/(S-S*)
     eL = EL / ρL + (Sstar - uL) * (Sstar + pL / mL)
-    UsL = (qL, qL * Sstar, qL * vL, qL * wL, qL * eL)
+    UsL = (qL, qL * Sstar, qL * vL, qL * wL, qL * eL, ntuple(q -> qL * WL[5 + q], Val(N - 5))...)
     qR = mR / (SR - Sstar)
     eR = ER / ρR + (Sstar - uR) * (Sstar + pR / mR)
-    UsR = (qR, qR * Sstar, qR * vR, qR * wR, qR * eR)
+    UsR = (qR, qR * Sstar, qR * vR, qR * wR, qR * eR, ntuple(q -> qR * WR[5 + q], Val(N - 5))...)
 
     z = zero(SL)
     return map(FL, FR, UL, UR, UsL, UsR) do fl, fr, ul, ur, usl, usr
