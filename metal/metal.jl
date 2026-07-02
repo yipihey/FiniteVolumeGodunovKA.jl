@@ -39,6 +39,10 @@ import FiniteVolumeGodunovKA: _update_dir, _gidx, _swap, identperm, dirperm, has
 @inline _mtid2() = thread_position_in_grid_2d()
 @inline _mtid3() = thread_position_in_grid_3d()
 
+# Metal hot stencils only request offsets ±1/±2, so periodic wrap can avoid the generic mod1 path.
+@inline _mgidx(i, n, ::Val{:periodic}) = ifelse(i < 1, i + n, ifelse(i > n, i - n, i))
+@inline _mgidx(i, n, ::Val{:outflow}) = min(max(i, 1), n)
+
 # =================================== 1D ===================================
 # Mirrors src/backend_cuda.jl: one x-sweep per step (1D has no dimensional splitting), maxspeed CFL.
 
@@ -511,6 +515,24 @@ end
 # velocity component from a lifted-buffer cell (slots 2,3,4 / ρ are raw, so no un-lift needed for u=ρu/ρ).
 @inline _vel_de16s(U, i, j, k, comp) = Float32(@inbounds U[i, j, k, comp]) / Float32(@inbounds U[i, j, k, 1])
 
+@inline _ld_de16s_axis(U, i, j, k, o, igs, nx, ny, nz, bc, ::Val{1}, ::Val{N}) where {N} =
+    _ld_de16s(U, _mgidx(i + o, nx, bc), j, k, igs, Val(N))
+@inline _ld_de16s_axis(U, i, j, k, o, igs, nx, ny, nz, bc, ::Val{2}, ::Val{N}) where {N} =
+    _ld_de16s(U, i, _mgidx(j + o, ny, bc), k, igs, Val(N))
+@inline _ld_de16s_axis(U, i, j, k, o, igs, nx, ny, nz, bc, ::Val{3}, ::Val{N}) where {N} =
+    _ld_de16s(U, i, j, _mgidx(k + o, nz, bc), igs, Val(N))
+
+@inline _st_de16s_axis!(U, i, j, k, o, v, gs, ::Val{1}) = _st_de16s!(U, i + o, j, k, v, gs)
+@inline _st_de16s_axis!(U, i, j, k, o, v, gs, ::Val{2}) = _st_de16s!(U, i, j + o, k, v, gs)
+@inline _st_de16s_axis!(U, i, j, k, o, v, gs, ::Val{3}) = _st_de16s!(U, i, j, k + o, v, gs)
+
+@inline function _mde16_half_axis(U, s, r, i, j, k, o, lam, igs, nx, ny, nz, bc, axis, perm, ::Val{N}) where {N}
+    um = _ld_de16s_axis(U, i, j, k, o - 1, igs, nx, ny, nz, bc, axis, Val(N))
+    u0 = _ld_de16s_axis(U, i, j, k, o,     igs, nx, ny, nz, bc, axis, Val(N))
+    up = _ld_de16s_axis(U, i, j, k, o + 1, igs, nx, ny, nz, bc, axis, Val(N))
+    return _halfstep(s, r, _swap(um, perm), _swap(u0, perm), _swap(up, perm), lam)
+end
+
 # --- the Enzo dual-energy switch + PdV (Float32), applied per cell AFTER the full Strang step. Mirrors the
 #     tail of k_ctus_de16 (transpile_cuda.jl): PdV on Ge, then the eta switch syncing Ge<->E. --------------
 # `divv_dx` = dx*(div v) from central differences; lam = dt/dx folds the 1/dx (0.5*lam central diff -> dt).
@@ -528,14 +550,14 @@ end
 end
 
 # Metal kernel: PdV + Enzo switch over the whole grid (compute f32, store f16, buffer stays lifted). Reads
-# the lifted f16 buffer, un-lifts into f32, applies PdV+switch, re-lifts the (E,Ge) on store. bc via _gidx.
+# the lifted f16 buffer, un-lifts into f32, applies PdV+switch, re-lifts the (E,Ge) on store.
 function _mde_switch3_kernel!(U, s, igs, gs, lam, nx, ny, nz, ::Val{N}, bc) where {N}
     i, j, k = _mtid3()
     if i <= nx && j <= ny && k <= nz
         u0 = _ld_de16s(U, i, j, k, igs, Val(N))
-        uxp = _vel_de16s(U, _gidx(i+1,nx,bc), j, k, 2); uxm = _vel_de16s(U, _gidx(i-1,nx,bc), j, k, 2)
-        vyp = _vel_de16s(U, i, _gidx(j+1,ny,bc), k, 3); vym = _vel_de16s(U, i, _gidx(j-1,ny,bc), k, 3)
-        wzp = _vel_de16s(U, i, j, _gidx(k+1,nz,bc), 4); wzm = _vel_de16s(U, i, j, _gidx(k-1,nz,bc), 4)
+        uxp = _vel_de16s(U, _mgidx(i+1,nx,bc), j, k, 2); uxm = _vel_de16s(U, _mgidx(i-1,nx,bc), j, k, 2)
+        vyp = _vel_de16s(U, i, _mgidx(j+1,ny,bc), k, 3); vym = _vel_de16s(U, i, _mgidx(j-1,ny,bc), k, 3)
+        wzp = _vel_de16s(U, i, j, _mgidx(k+1,nz,bc), 4); wzm = _vel_de16s(U, i, j, _mgidx(k-1,nz,bc), 4)
         divv_dx = 0.5f0 * ((uxp - uxm) + (vyp - vym) + (wzp - wzm))
         _st_de16s!(U, i, j, k, _mde_pdv_switch(s, u0, divv_dx, lam), gs)
     end
@@ -549,8 +571,8 @@ function _mde16_sweepx3_kernel!(Unew, U, s, r, rs, lam, igs, gs, nx, ny, nz, ::V
     i, j, k = _mtid3()
     if i <= nx && j <= ny && k <= nz
         _st_de16s!(Unew, i, j, k, _update_dir(s, r, rs,
-            _ld_de16s(U,_gidx(i-2,nx,bc),j,k,igs,Val(N)), _ld_de16s(U,_gidx(i-1,nx,bc),j,k,igs,Val(N)), _ld_de16s(U,i,j,k,igs,Val(N)),
-            _ld_de16s(U,_gidx(i+1,nx,bc),j,k,igs,Val(N)), _ld_de16s(U,_gidx(i+2,nx,bc),j,k,igs,Val(N)), lam, perm), gs)
+            _ld_de16s(U,_mgidx(i-2,nx,bc),j,k,igs,Val(N)), _ld_de16s(U,_mgidx(i-1,nx,bc),j,k,igs,Val(N)), _ld_de16s(U,i,j,k,igs,Val(N)),
+            _ld_de16s(U,_mgidx(i+1,nx,bc),j,k,igs,Val(N)), _ld_de16s(U,_mgidx(i+2,nx,bc),j,k,igs,Val(N)), lam, perm), gs)
     end
     return
 end
@@ -558,8 +580,8 @@ function _mde16_sweepy3_kernel!(Unew, U, s, r, rs, lam, igs, gs, nx, ny, nz, ::V
     i, j, k = _mtid3()
     if i <= nx && j <= ny && k <= nz
         _st_de16s!(Unew, i, j, k, _update_dir(s, r, rs,
-            _ld_de16s(U,i,_gidx(j-2,ny,bc),k,igs,Val(N)), _ld_de16s(U,i,_gidx(j-1,ny,bc),k,igs,Val(N)), _ld_de16s(U,i,j,k,igs,Val(N)),
-            _ld_de16s(U,i,_gidx(j+1,ny,bc),k,igs,Val(N)), _ld_de16s(U,i,_gidx(j+2,ny,bc),k,igs,Val(N)), lam, perm), gs)
+            _ld_de16s(U,i,_mgidx(j-2,ny,bc),k,igs,Val(N)), _ld_de16s(U,i,_mgidx(j-1,ny,bc),k,igs,Val(N)), _ld_de16s(U,i,j,k,igs,Val(N)),
+            _ld_de16s(U,i,_mgidx(j+1,ny,bc),k,igs,Val(N)), _ld_de16s(U,i,_mgidx(j+2,ny,bc),k,igs,Val(N)), lam, perm), gs)
     end
     return
 end
@@ -567,8 +589,38 @@ function _mde16_sweepz3_kernel!(Unew, U, s, r, rs, lam, igs, gs, nx, ny, nz, ::V
     i, j, k = _mtid3()
     if i <= nx && j <= ny && k <= nz
         _st_de16s!(Unew, i, j, k, _update_dir(s, r, rs,
-            _ld_de16s(U,i,j,_gidx(k-2,nz,bc),igs,Val(N)), _ld_de16s(U,i,j,_gidx(k-1,nz,bc),igs,Val(N)), _ld_de16s(U,i,j,k,igs,Val(N)),
-            _ld_de16s(U,i,j,_gidx(k+1,nz,bc),igs,Val(N)), _ld_de16s(U,i,j,_gidx(k+2,nz,bc),igs,Val(N)), lam, perm), gs)
+            _ld_de16s(U,i,j,_mgidx(k-2,nz,bc),igs,Val(N)), _ld_de16s(U,i,j,_mgidx(k-1,nz,bc),igs,Val(N)), _ld_de16s(U,i,j,k,igs,Val(N)),
+            _ld_de16s(U,i,j,_mgidx(k+1,nz,bc),igs,Val(N)), _ld_de16s(U,i,j,_mgidx(k+2,nz,bc),igs,Val(N)), lam, perm), gs)
+    end
+    return
+end
+
+# Large-grid pair sweep for the f16-storage dual-energy path. This mirrors the f32 Metal pair sweep above:
+# one thread updates two adjacent cells along the active axis and shares the middle interface flux.
+function _mde16_step3_pair_kernel!(Unew, U, s, r, rs, lam, igs, gs, nx, ny, nz, ::Val{N}, bc, axis::Val{A}, perm) where {N,A}
+    ti, tj, tk = _mtid3()
+    i, j, k = _maxis_coord(ti, tj, tk, axis)
+    if _maxis_valid(i, j, k, nx, ny, nz, axis)
+        wlm, wrm = _mde16_half_axis(U, s, r, i, j, k, -1, lam, igs, nx, ny, nz, bc, axis, perm, Val(N))
+        wl0, wr0 = _mde16_half_axis(U, s, r, i, j, k,  0, lam, igs, nx, ny, nz, bc, axis, perm, Val(N))
+        wl1, wr1 = _mde16_half_axis(U, s, r, i, j, k,  1, lam, igs, nx, ny, nz, bc, axis, perm, Val(N))
+        f0 = riemann(rs, s, wrm, wl0)
+        f1 = riemann(rs, s, wr0, wl1)
+        u0 = _ld_de16s_axis(U, i, j, k, 0, igs, nx, ny, nz, bc, axis, Val(N))
+        _st_de16s_axis!(Unew, i, j, k, 0, u0 .- lam .* _swap(f1 .- f0, perm), gs, axis)
+        if A == 1
+            ok2 = i + 1 <= nx
+        elseif A == 2
+            ok2 = j + 1 <= ny
+        else
+            ok2 = k + 1 <= nz
+        end
+        if ok2
+            wl2, wr2 = _mde16_half_axis(U, s, r, i, j, k, 2, lam, igs, nx, ny, nz, bc, axis, perm, Val(N))
+            f2 = riemann(rs, s, wr1, wl2)
+            u1 = _ld_de16s_axis(U, i, j, k, 1, igs, nx, ny, nz, bc, axis, Val(N))
+            _st_de16s_axis!(Unew, i, j, k, 1, u1 .- lam .* _swap(f2 .- f1, perm), gs, axis)
+        end
     end
     return
 end
@@ -587,7 +639,7 @@ end
 # --- f16-STORAGE dual-energy 3D grid: MtlArray{Float16} U/Unew (HALF the f32 bytes), GE_SCALE-lifted energies.
 mutable struct Grid3DMtlDE16{N,T,S<:FVSystem,R,RS}
     sys::S; recon::R; rsol::RS
-    U::MtlArray{T,4}; Unew::MtlArray{T,4}; spd::MtlArray{Float32,3}
+    U::MtlArray{T,4}; Unew::MtlArray{T,4}; spd::Union{Nothing,MtlArray{Float32,3}}
     nx::Int; ny::Int; nz::Int; dx::Float32; dy::Float32; dz::Float32; bc::Symbol; cfl::Float32
     gs::Float32; store::Symbol; de_prec::Symbol   # GE_SCALE is Float32 (1e7 overflows Float16->Inf)
 end
@@ -601,7 +653,8 @@ into f16's normal range on store and un-lifted on load (mirrors CUDA `ld_de16s_U
 function Grid3DMtlDE16(sys::Union{EulerDE,EulerDEColors}, U0::Array{NTuple{N,TI},3};
                        dx, dy, dz, bc::Symbol = :periodic, recon = PLM(), rsol = LLF(),
                        cfl = 0.3f0, ge_scale::Real = MTL_GE_SCALE,
-                       store::Symbol = :f16, de_prec::Symbol = :f16) where {N,TI}
+                       store::Symbol = :f16, de_prec::Symbol = :f16,
+                       speed_scratch::Bool = true) where {N,TI}
     store === :f16 || error("Grid3DMtlDE16 is the f16-storage path (store=:f16).")
     de_prec === :f16 || error("Grid3DMtlDE16 is the all-f16 dual-energy path (de_prec=:f16).")
     T = Float16; gs = Float32(ge_scale); nx, ny, nz = size(U0)  # GE_SCALE stays f32 (1e7 > f16 max)
@@ -610,8 +663,9 @@ function Grid3DMtlDE16(sys::Union{EulerDE,EulerDEColors}, U0::Array{NTuple{N,TI}
         v = Float32(U0[i,j,k][c]); Uh[i,j,k,c] = T((c == 5 || c == 6) ? v * gs : v)   # lift energies (f32 GE_SCALE)
     end
     U = MtlArray(Uh)
+    spd = speed_scratch ? Metal.zeros(Float32, nx, ny, nz) : nothing
     Grid3DMtlDE16{N,T,typeof(sys),typeof(recon),typeof(rsol)}(
-        sys, recon, rsol, U, similar(U), Metal.zeros(Float32, nx, ny, nz),
+        sys, recon, rsol, U, similar(U), spd,
         nx, ny, nz, Float32(dx), Float32(dy), Float32(dz), bc, Float32(cfl), gs, store, de_prec)
 end
 
@@ -620,27 +674,32 @@ end
 Allocate an empty f16-storage Metal dual-energy grid without materializing a host
 `Array{NTuple}` initializer or a host Float16 staging cube. Callers that immediately
 fill `g.U` on device, such as CICASS' patch/FVGK gather path, avoid a large startup
-peak while preserving the same persistent `U`, `Unew`, and `spd` layout.
+peak. `speed_scratch=false` also skips the persistent `spd` grid when an external
+CFL signal is supplied by the driver.
 """
 function Grid3DMtlDE16(sys::Union{EulerDE,EulerDEColors}, dims::NTuple{3,Int};
                        dx, dy, dz, bc::Symbol = :periodic, recon = PLM(), rsol = LLF(),
                        cfl = 0.3f0, ge_scale::Real = MTL_GE_SCALE,
-                       store::Symbol = :f16, de_prec::Symbol = :f16)
+                       store::Symbol = :f16, de_prec::Symbol = :f16,
+                       speed_scratch::Bool = true)
     return _Grid3DMtlDE16_empty(sys, Val(FV.nconserved(sys)), dims;
         dx=dx, dy=dy, dz=dz, bc=bc, recon=recon, rsol=rsol,
-        cfl=cfl, ge_scale=ge_scale, store=store, de_prec=de_prec)
+        cfl=cfl, ge_scale=ge_scale, store=store, de_prec=de_prec,
+        speed_scratch=speed_scratch)
 end
 
 function _Grid3DMtlDE16_empty(sys::Union{EulerDE,EulerDEColors}, ::Val{N}, dims::NTuple{3,Int};
                               dx, dy, dz, bc::Symbol = :periodic, recon = PLM(), rsol = LLF(),
                               cfl = 0.3f0, ge_scale::Real = MTL_GE_SCALE,
-                              store::Symbol = :f16, de_prec::Symbol = :f16) where {N}
+                              store::Symbol = :f16, de_prec::Symbol = :f16,
+                              speed_scratch::Bool = true) where {N}
     store === :f16 || error("Grid3DMtlDE16 is the f16-storage path (store=:f16).")
     de_prec === :f16 || error("Grid3DMtlDE16 is the all-f16 dual-energy path (de_prec=:f16).")
     T = Float16; gs = Float32(ge_scale); nx, ny, nz = dims
     U = Metal.zeros(T, nx, ny, nz, N)
+    spd = speed_scratch ? Metal.zeros(Float32, nx, ny, nz) : nothing
     Grid3DMtlDE16{N,T,typeof(sys),typeof(recon),typeof(rsol)}(
-        sys, recon, rsol, U, similar(U), Metal.zeros(Float32, nx, ny, nz),
+        sys, recon, rsol, U, similar(U), spd,
         nx, ny, nz, Float32(dx), Float32(dy), Float32(dz), bc, Float32(cfl), gs, store, de_prec)
 end
 
@@ -658,6 +717,24 @@ function _mde16_sweep!(g::Grid3DMtlDE16{N,T}, dt, axis::Val{A}, perm) where {N,T
     return g
 end
 
+function _mde16_pair_sweep!(g::Grid3DMtlDE16{N,T}, dt, axis::Val{A}, perm) where {N,T,A}
+    thr, grp = _mpaircfg3(g.nx, g.ny, g.nz, axis)
+    lam = A == 1 ? Float32(dt)/g.dx : A == 2 ? Float32(dt)/g.dy : Float32(dt)/g.dz
+    igs = Float32(inv(g.gs)); gs = Float32(g.gs)
+    Metal.@metal threads=thr groups=grp _mde16_step3_pair_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
+        lam, igs, gs, g.nx, g.ny, g.nz, Val(N), Val(g.bc), axis, perm)
+    g.U, g.Unew = g.Unew, g.U
+    return g
+end
+
+function _mde16_pair_min()
+    v = tryparse(Int, get(ENV, "FVGK_MTL_DE16_PAIR_MIN", "96"))
+    return v === nothing ? 96 : v
+end
+
+_mde16_use_pair3(g::Grid3DMtlDE16) =
+    get(ENV, "FVGK_MTL_DE16_PAIR", "1") != "0" && min(g.nx, g.ny, g.nz) >= _mde16_pair_min()
+
 # one full f16-storage dual-energy Strang step. The buffer stays GE_SCALE-LIFTED at ALL times (cold energies
 # would flush to 0 if ever written un-lifted to Float16); each kernel un-lifts only into f32 registers (the
 # CUDA ld_de16s_U/st_de16s_U convention) — so NO standalone scale passes. The split sweeps advect Ge + the
@@ -665,10 +742,11 @@ end
 function mde16_step!(g::Grid3DMtlDE16{N,T}, dt; rev::Bool = false) where {N,T}
     px = identperm(Val(N)); py = dirperm(g.sys, N, 2); pz = dirperm(g.sys, N, 3)
     thr, grp = _mcfg3(g.nx, g.ny, g.nz); igs = Float32(inv(g.gs)); gs = Float32(g.gs)
+    sweep! = _mde16_use_pair3(g) ? _mde16_pair_sweep! : _mde16_sweep!
     if rev
-        _mde16_sweep!(g, dt, Val(3), pz); _mde16_sweep!(g, dt, Val(2), py); _mde16_sweep!(g, dt, Val(1), px)
+        sweep!(g, dt, Val(3), pz); sweep!(g, dt, Val(2), py); sweep!(g, dt, Val(1), px)
     else
-        _mde16_sweep!(g, dt, Val(1), px); _mde16_sweep!(g, dt, Val(2), py); _mde16_sweep!(g, dt, Val(3), pz)
+        sweep!(g, dt, Val(1), px); sweep!(g, dt, Val(2), py); sweep!(g, dt, Val(3), pz)
     end
     lam = Float32(dt) / g.dx
     Metal.@metal threads=thr groups=grp _mde_switch3_kernel!(g.U, g.sys, igs, gs, lam, g.nx, g.ny, g.nz, Val(N), Val(g.bc))
@@ -676,10 +754,47 @@ function mde16_step!(g::Grid3DMtlDE16{N,T}, dt; rev::Bool = false) where {N,T}
 end
 
 function mde16_max_wavespeed(g::Grid3DMtlDE16{N,T}) where {N,T}
+    g.spd === nothing && (g.spd = Metal.zeros(Float32, g.nx, g.ny, g.nz))
     thr, grp = _mcfg3(g.nx, g.ny, g.nz); igs = Float32(inv(g.gs))
     Metal.@metal threads=thr groups=grp _mde_speed3_kernel!(g.spd, g.U, g.sys, igs, g.nx, g.ny, g.nz, Val(N),
         dirperm(g.sys, N, 2), dirperm(g.sys, N, 3))
     return maximum(g.spd)
+end
+
+function _mde16_grav_kick_global_phi_kernel!(U, φg, n1::Int, n2::Int, n3::Int,
+                                             hc::Float32, halfdt::Float32, gs::Float32)
+    i, j, k = _mtid3()
+    if i <= n1 && j <= n2 && k <= n3
+        ip = i == n1 ? 1 : i + 1; im = i == 1 ? n1 : i - 1
+        jp = j == n2 ? 1 : j + 1; jm = j == 1 ? n2 : j - 1
+        kp = k == n3 ? 1 : k + 1; km = k == 1 ? n3 : k - 1
+        n12 = n1 * n2
+        idx = i + n1 * (j - 1) + n12 * (k - 1)
+        gx = -hc * (Float32(@inbounds φg[ip + n1 * (j - 1) + n12 * (k - 1)]) -
+                    Float32(@inbounds φg[im + n1 * (j - 1) + n12 * (k - 1)]))
+        gy = -hc * (Float32(@inbounds φg[i + n1 * (jp - 1) + n12 * (k - 1)]) -
+                    Float32(@inbounds φg[i + n1 * (jm - 1) + n12 * (k - 1)]))
+        gz = -hc * (Float32(@inbounds φg[i + n1 * (j - 1) + n12 * (kp - 1)]) -
+                    Float32(@inbounds φg[i + n1 * (j - 1) + n12 * (km - 1)]))
+        vol = n12 * n3
+        iρ = idx; is1 = idx + vol; is2 = idx + 2 * vol; is3 = idx + 3 * vol; iτ = idx + 4 * vol
+        d = Float32(@inbounds U[iρ])
+        s1 = Float32(@inbounds U[is1]); s2 = Float32(@inbounds U[is2]); s3 = Float32(@inbounds U[is3])
+        dS1 = d * gx * halfdt; dS2 = d * gy * halfdt; dS3 = d * gz * halfdt
+        dKE = ((s1 * dS1 + s2 * dS2 + s3 * dS3) + 0.5f0 * (dS1*dS1 + dS2*dS2 + dS3*dS3)) / d
+        @inbounds U[iτ] += Float16(dKE * gs)
+        @inbounds U[is1] = Float16(s1 + dS1)
+        @inbounds U[is2] = Float16(s2 + dS2)
+        @inbounds U[is3] = Float16(s3 + dS3)
+    end
+    return
+end
+
+function mde16_grav_kick_global_potential!(g::Grid3DMtlDE16, φg; dx::Real, halfdt::Real)
+    thr, grp = _mcfg3(g.nx, g.ny, g.nz)
+    Metal.@metal threads=thr groups=grp _mde16_grav_kick_global_phi_kernel!(
+        g.U, φg, g.nx, g.ny, g.nz, Float32(0.5) / Float32(dx), Float32(halfdt), Float32(g.gs))
+    return g
 end
 
 function mde16_evolve!(g::Grid3DMtlDE16, tend; maxsteps::Int = 10^7)
